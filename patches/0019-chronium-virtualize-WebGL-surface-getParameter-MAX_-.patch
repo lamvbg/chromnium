@@ -1,0 +1,593 @@
+From 55fb30d049114f31abbc3c1a176334555e8d788b Mon Sep 17 00:00:00 2001
+From: Chronium <chronium@interlink.local>
+Date: Wed, 10 Jun 2026 14:24:10 +0700
+Subject: [PATCH] chronium: virtualize WebGL surface (getParameter MAX_* /
+ ranges + getShaderPrecisionFormat) per profile
+
+Real Chrome's UNMASKED_RENDERER_WEBGL is cross-checked by CreepJS / iphey
+/ PixelScan against the behavioral GPU surface: MAX_TEXTURE_SIZE,
+MAX_VERTEX_UNIFORM_VECTORS, MAX_VIEWPORT_DIMS, ALIASED_LINE_WIDTH_RANGE,
+shader precision triples. Spoofing only the renderer string still loses
+to 'claims RTX 3060 but MAX_VERTEX_UNIFORM_VECTORS=1024 (= Intel iGPU)'.
+
+This patch virtualizes the full param surface from the profile JSON so
+the entire WebGL fingerprint is internally coherent with the claimed
+renderer.
+
+Plumbing follows the established pattern (patches 0011, 0015, 0018):
+- chrome_switches.{h,cc}: new kFingerprintWebGLParams switch.
+- fingerprint_profile.{h,cc}: WebGLParamsBlob() walks the profile's
+  webgl.params dict (int / [int,int] / [float,float]) and
+  webgl.shader_precision dict ({shader-hex: {precision-hex: triple}})
+  into a TSV blob; chrome_content_browser_client appends hex-encoded.
+- chrome_content_renderer_client.cc: decodes hex + feeds
+  FingerprintState::SetWebGLParams.
+- fingerprint_state.{h,cc}: SetWebGLParams parser + 4 typed accessors
+  (WebGLIntParam, WebGLIntRangeParam, WebGLFloatRangeParam,
+  WebGLShaderPrecision) with sentinel returns when not pinned so the
+  WebGL getParameter switch falls through unchanged.
+- webgl_rendering_context_base.cc::getParameter early-returns spoofed
+  values before any GL roundtrip. Sentinels: -1 for int, INT32_MIN
+  for int range, -1.0f for float range.
+- webgl_rendering_context_base.cc::getShaderPrecisionFormat early-
+  returns the pinned triple; sentinel precision=-1 means fall through.
+
+Profile schema additions:
+  webgl.params: { '0x0D33': 16384, '0x0D3A': [32768, 32768],
+                  '0x846E': [1.0, 1.0], ... }
+  webgl.shader_precision: { '0x8B31': { '0x8DF0': [127,127,23], ... },
+                            '0x8B30': { ... } }
+
+The 170 bundled JSONs were enriched via scripts/enrich-webgl-params.py
+with vendor-appropriate values:
+  NVIDIA/AMD discrete: MAX_VERTEX_UNIFORM_VECTORS=4095, MAX_VIEWPORT=[32768,32768]
+  Intel iGPU: MAX_VERTEX_UNIFORM_VECTORS=1024, MAX_VIEWPORT=[16384,16384]
+  Intel HD2500/3000: MAX_TEXTURE_SIZE=8192
+  ANGLE D3D11 shader precision: same triples across vendors (HLSL compiler-set)
+---
+ .../browser/chrome_content_browser_client.cc  |   8 +
+ .../fingerprint/fingerprint_profile.cc        |  75 +++++++
+ .../browser/fingerprint/fingerprint_profile.h |   8 +
+ chrome/common/chrome_switches.cc              |   1 +
+ chrome/common/chrome_switches.h               |  10 +
+ .../chrome_content_renderer_client.cc         |  10 +
+ .../webgl/webgl_rendering_context_base.cc     |  47 ++++
+ .../platform/fingerprint/fingerprint_state.cc | 204 ++++++++++++++++++
+ .../platform/fingerprint/fingerprint_state.h  |  31 +++
+ 9 files changed, 394 insertions(+)
+
+diff --git a/chrome/browser/chrome_content_browser_client.cc b/chrome/browser/chrome_content_browser_client.cc
+index c209e77976075..9c4ff4f19dd7f 100644
+--- a/chrome/browser/chrome_content_browser_client.cc
++++ b/chrome/browser/chrome_content_browser_client.cc
+@@ -2903,6 +2903,14 @@ void ChromeContentBrowserClient::AppendExtraCommandLineSwitches(
+             switches::kFingerprintWebGLExtensions,
+             base::HexEncode(base::as_byte_span(webgl_exts)));
+       }
++      const std::string webgl_params = fp->WebGLParamsBlob();
++      if (!webgl_params.empty()) {
++        // Hex-encode for the same argv-tab/newline reason. Renderer
++        // hex-decodes and feeds FingerprintState::SetWebGLParams.
++        command_line->AppendSwitchASCII(
++            switches::kFingerprintWebGLParams,
++            base::HexEncode(base::as_byte_span(webgl_params)));
++      }
+       const std::string audio_noise = fp->AudioNoiseValue();
+       if (!audio_noise.empty()) {
+         command_line->AppendSwitchASCII(switches::kFingerprintAudioNoise,
+diff --git a/chrome/browser/fingerprint/fingerprint_profile.cc b/chrome/browser/fingerprint/fingerprint_profile.cc
+index 0857ac0d805de..eb50293dd7aeb 100644
+--- a/chrome/browser/fingerprint/fingerprint_profile.cc
++++ b/chrome/browser/fingerprint/fingerprint_profile.cc
+@@ -12,6 +12,7 @@
+ #include "base/files/file_util.h"
+ #include "base/json/json_reader.h"
+ #include "base/logging.h"
++#include "base/strings/string_number_conversions.h"
+ #include "base/strings/stringprintf.h"
+ 
+ namespace chronium {
+@@ -442,6 +443,80 @@ std::string FingerprintProfile::WebGLExtensionsBlob() const {
+   return out;
+ }
+ 
++std::string FingerprintProfile::WebGLParamsBlob() const {
++  // Build a TSV blob the renderer's FingerprintState::SetWebGLParams
++  // parser consumes. Read both `webgl.params` (a dict keyed by GLenum
++  // hex; values are int, [int,int], or [float,float]) and
++  // `webgl.shader_precision` (a dict keyed by shader_type-hex, each
++  // value is itself a dict keyed by precision_type-hex with a triple
++  // [range_min, range_max, precision]). Both keys are optional —
++  // omitting one just leaves that table unpopulated on the renderer
++  // side.
++  if (!loaded_) {
++    return {};
++  }
++  const base::DictValue* webgl = dict_.FindDict("webgl");
++  if (!webgl) {
++    return {};
++  }
++  std::string out;
++  auto append_line = [&](std::string line) {
++    if (!out.empty()) {
++      out += '\n';
++    }
++    out += std::move(line);
++  };
++
++  const base::DictValue* params = webgl->FindDict("params");
++  if (params) {
++    for (const auto [pname_str, value] : *params) {
++      // pname can be either int or string-of-int. Use the string form
++      // verbatim — the renderer parser accepts decimal or 0xHEX.
++      if (value.is_int()) {
++        append_line("i\t" + pname_str + "\t" +
++                    base::NumberToString(value.GetInt()));
++      } else if (const base::ListValue* arr = value.GetIfList()) {
++        if (arr->size() != 2) continue;
++        const base::Value& a = (*arr)[0];
++        const base::Value& b = (*arr)[1];
++        if (a.is_int() && b.is_int()) {
++          append_line("ir\t" + pname_str + "\t" +
++                      base::NumberToString(a.GetInt()) + "\t" +
++                      base::NumberToString(b.GetInt()));
++        } else if (a.is_double() || a.is_int()) {
++          // Float-range — accept ints too (e.g. [1, 1] for line width).
++          double da = a.is_double() ? a.GetDouble() : a.GetInt();
++          double db = b.is_double() ? b.GetDouble() : b.GetInt();
++          append_line("fr\t" + pname_str + "\t" +
++                      base::NumberToString(da) + "\t" +
++                      base::NumberToString(db));
++        }
++      }
++    }
++  }
++
++  const base::DictValue* prec = webgl->FindDict("shader_precision");
++  if (prec) {
++    for (const auto [shader_str, shader_v] : *prec) {
++      const base::DictValue* inner = shader_v.GetIfDict();
++      if (!inner) continue;
++      for (const auto [prec_str, val] : *inner) {
++        const base::ListValue* arr = val.GetIfList();
++        if (!arr || arr->size() != 3) continue;
++        if (!(*arr)[0].is_int() || !(*arr)[1].is_int() ||
++            !(*arr)[2].is_int()) {
++          continue;
++        }
++        append_line("sp\t" + shader_str + "\t" + prec_str + "\t" +
++                    base::NumberToString((*arr)[0].GetInt()) + "\t" +
++                    base::NumberToString((*arr)[1].GetInt()) + "\t" +
++                    base::NumberToString((*arr)[2].GetInt()));
++      }
++    }
++  }
++  return out;
++}
++
+ std::string FingerprintProfile::AudioNoiseValue() const {
+   if (!loaded_) {
+     return {};
+diff --git a/chrome/browser/fingerprint/fingerprint_profile.h b/chrome/browser/fingerprint/fingerprint_profile.h
+index 36b055f465db6..81803da375261 100644
+--- a/chrome/browser/fingerprint/fingerprint_profile.h
++++ b/chrome/browser/fingerprint/fingerprint_profile.h
+@@ -133,6 +133,14 @@ class FingerprintProfile : public chrome::mojom::FingerprintConfigProvider {
+   // override.
+   std::string WebGLExtensionsBlob() const;
+ 
++  // WebGL getParameter() + getShaderPrecisionFormat() override. Built
++  // from `webgl.params` (single ints / int-ranges / float-ranges) and
++  // `webgl.shader_precision` (per shader/precision triples) in the
++  // profile JSON. Lines separated by '\n', tab-separated fields. See
++  // chrome_switches.h::kFingerprintWebGLParams for the format. Empty
++  // when neither key is set in the profile.
++  std::string WebGLParamsBlob() const;
++
+   // AudioContext sample-noise enable. "1" = enabled (legacy), "0" =
+   // disabled. Empty when the profile doesn't explicitly set it (then
+   // the renderer keeps the historical default of enabled).
+diff --git a/chrome/common/chrome_switches.cc b/chrome/common/chrome_switches.cc
+index b08532e8c9ded..8017f0c3ec91d 100644
+--- a/chrome/common/chrome_switches.cc
++++ b/chrome/common/chrome_switches.cc
+@@ -377,6 +377,7 @@ const char kFingerprintWebGLLimits[] = "fingerprint-webgl-limits";
+ const char kFingerprintSpeechVoices[] = "fingerprint-speech-voices";
+ const char kFingerprintWebAuthnUvpa[] = "fingerprint-webauthn-uvpa";
+ const char kFingerprintWebGLExtensions[] = "fingerprint-webgl-extensions";
++const char kFingerprintWebGLParams[] = "fingerprint-webgl-params";
+ const char kFingerprintAudioNoise[] = "fingerprint-audio-noise";
+ 
+ // Does not show the crash restore bubble when the browser is started during the
+diff --git a/chrome/common/chrome_switches.h b/chrome/common/chrome_switches.h
+index 6a3156fa55630..980a944d216fb 100644
+--- a/chrome/common/chrome_switches.h
++++ b/chrome/common/chrome_switches.h
+@@ -202,6 +202,16 @@ extern const char kFingerprintWebAuthnUvpa[];
+ // argv-splitting on whitespace.
+ extern const char kFingerprintWebGLExtensions[];
+ 
++// Chronium (internal): WebGL getParameter() + getShaderPrecisionFormat()
++// surface override. TSV blob (hex-encoded; same encoding rationale as
++// the extension list above) where every line is one of:
++//   i\t<pname-hex>\t<int-value>
++//   ir\t<pname-hex>\t<int>\t<int>
++//   fr\t<pname-hex>\t<float>\t<float>
++//   sp\t<shader-hex>\t<precision-hex>\t<rmin>\t<rmax>\t<precision>
++// Empty / absent = no override.
++extern const char kFingerprintWebGLParams[];
++
+ // Chronium (internal): AudioContext sample noise toggle. "0" = disable,
+ // "1" = enable. Absent = enabled (legacy default). Set "0" when the
+ // profile pins a real-but-vanilla device that anti-bot traps would
+diff --git a/chrome/renderer/chrome_content_renderer_client.cc b/chrome/renderer/chrome_content_renderer_client.cc
+index a637197df372d..93671af13745c 100644
+--- a/chrome/renderer/chrome_content_renderer_client.cc
++++ b/chrome/renderer/chrome_content_renderer_client.cc
+@@ -563,6 +563,16 @@ void ChromeContentRendererClient::RenderThreadStarted() {
+         blink::FingerprintState::SetWebGLExtensions(exts_blob);
+       }
+     }
++    const std::string webgl_params_hex =
++        cmd_line->GetSwitchValueASCII(switches::kFingerprintWebGLParams);
++    if (!webgl_params_hex.empty()) {
++      std::vector<uint8_t> bytes;
++      if (base::HexStringToBytes(webgl_params_hex, &bytes) && !bytes.empty()) {
++        std::string_view params_blob(
++            reinterpret_cast<const char*>(bytes.data()), bytes.size());
++        blink::FingerprintState::SetWebGLParams(params_blob);
++      }
++    }
+     const std::string audio_noise =
+         cmd_line->GetSwitchValueASCII(switches::kFingerprintAudioNoise);
+     if (!audio_noise.empty()) {
+diff --git a/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc b/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
+index 273d4eaeac6c2..e13d6bda484b0 100644
+--- a/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
++++ b/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
+@@ -3789,6 +3789,40 @@ ScriptValue WebGLRenderingContextBase::getParameter(ScriptState* script_state,
+                                                     GLenum pname) {
+   if (isContextLost())
+     return ScriptValue::CreateNull(script_state->GetIsolate());
++
++  // Chronium: short-circuit the GPU-fingerprintable MAX_* / range
++  // parameters before any GL roundtrip so the spoofed renderer string
++  // (UNMASKED_RENDERER_WEBGL) is internally consistent with everything
++  // a fingerprinter probes. Cross-checks at iphey/CreepJS/PixelScan
++  // catch "claims NVIDIA RTX 3060 but MAX_TEXTURE_SIZE == 8192" (a
++  // signature of older Intel iGPUs) — and the inverse — every time.
++  // FingerprintState returns -1 for "not pinned" so the original GL
++  // path runs unchanged for any pname we don't override.
++  {
++    int64_t v = FingerprintState::WebGLIntParam(pname);
++    if (v >= 0) {
++      return WebGLAny(script_state, static_cast<int>(v));
++    }
++    std::pair<int32_t, int32_t> r =
++        FingerprintState::WebGLIntRangeParam(pname);
++    if (r.first != INT32_MIN) {
++      DOMInt32Array* arr = DOMInt32Array::Create(2);
++      auto data = arr->AsSpan();
++      data[0] = r.first;
++      data[1] = r.second;
++      return WebGLAny(script_state, arr);
++    }
++    std::pair<float, float> fr =
++        FingerprintState::WebGLFloatRangeParam(pname);
++    if (fr.first != -1.0f || fr.second != -1.0f) {
++      DOMFloat32Array* arr = DOMFloat32Array::Create(2);
++      auto data = arr->AsSpan();
++      data[0] = fr.first;
++      data[1] = fr.second;
++      return WebGLAny(script_state, arr);
++    }
++  }
++
+   const int kIntZero = 0;
+   switch (pname) {
+     case GL_ACTIVE_TEXTURE:
+@@ -4316,6 +4350,19 @@ WebGLShaderPrecisionFormat* WebGLRenderingContextBase::getShaderPrecisionFormat(
+ 
+   GLint range[2] = {0, 0};
+   GLint precision = 0;
++  // Chronium: when the profile pins a shader-precision triple for this
++  // (shader_type, precision_type), return it directly. Drivers report
++  // identifiable values here — Apple Metal vs ANGLE D3D11 vs Mesa each
++  // emit a distinct precision profile, and CreepJS catalogs them. The
++  // canned value comes from the profile JSON's
++  // `webgl.shader_precision.<shader>.<prec>` triple.
++  std::tuple<int32_t, int32_t, int32_t> pinned =
++      FingerprintState::WebGLShaderPrecision(shader_type, precision_type);
++  if (std::get<2>(pinned) >= 0) {
++    return MakeGarbageCollected<WebGLShaderPrecisionFormat>(
++        std::get<0>(pinned), std::get<1>(pinned), std::get<2>(pinned));
++  }
++
+   ContextGL()->GetShaderPrecisionFormat(shader_type, precision_type, range,
+                                         &precision);
+   return MakeGarbageCollected<WebGLShaderPrecisionFormat>(range[0], range[1],
+diff --git a/third_party/blink/renderer/platform/fingerprint/fingerprint_state.cc b/third_party/blink/renderer/platform/fingerprint/fingerprint_state.cc
+index 047425733ac09..ef98d8aaa7d25 100644
+--- a/third_party/blink/renderer/platform/fingerprint/fingerprint_state.cc
++++ b/third_party/blink/renderer/platform/fingerprint/fingerprint_state.cc
+@@ -5,10 +5,14 @@
+ 
+ #include <atomic>
+ #include <cstring>
++#include <tuple>
++#include <unordered_map>
++#include <utility>
+ 
+ #include "base/compiler_specific.h"
+ #include "base/containers/span.h"
+ #include "base/no_destructor.h"
++#include "base/strings/string_number_conversions.h"
+ 
+ namespace blink {
+ 
+@@ -122,6 +126,50 @@ std::string& WebGLExtensionsStorage() {
+ }
+ std::atomic<bool> g_webgl_extensions_set{false};
+ 
++// Full WebGL parameter surface. Three parallel maps keyed by GLenum
++// (pname) cover the three value shapes WebGLRenderingContextBase's
++// getParameter switch returns: single int, int-range pair, float-range
++// pair. Shader precision is a separate map keyed by the (shader_type,
++// precision_type) composite, since the spec exposes it via the
++// distinct getShaderPrecisionFormat() entry point. All four are
++// populated once during SetWebGLParams() at process start and read
++// from many times per frame, so we lock only on the rare write path
++// and let the (cheap) std::unordered_map lookups race lock-free under
++// the assumption the write happens before any getParameter call.
++using WebGLIntMap = std::unordered_map<uint32_t, int64_t>;
++using WebGLIntRangeMap = std::unordered_map<uint32_t,
++                                            std::pair<int32_t, int32_t>>;
++using WebGLFloatRangeMap = std::unordered_map<uint32_t,
++                                              std::pair<float, float>>;
++using WebGLPrecisionMap = std::unordered_map<uint64_t,
++                                             std::tuple<int32_t, int32_t,
++                                                        int32_t>>;
++
++WebGLIntMap& WebGLIntStorage() {
++  static base::NoDestructor<WebGLIntMap> s;
++  return *s;
++}
++WebGLIntRangeMap& WebGLIntRangeStorage() {
++  static base::NoDestructor<WebGLIntRangeMap> s;
++  return *s;
++}
++WebGLFloatRangeMap& WebGLFloatRangeStorage() {
++  static base::NoDestructor<WebGLFloatRangeMap> s;
++  return *s;
++}
++WebGLPrecisionMap& WebGLPrecisionStorage() {
++  static base::NoDestructor<WebGLPrecisionMap> s;
++  return *s;
++}
++std::atomic<bool> g_webgl_params_set{false};
++
++// Pack (shader_type, precision_type) into one 64-bit key. Both fit in
++// 32 bits each.
++uint64_t PrecisionKey(uint32_t shader_type, uint32_t precision_type) {
++  return (static_cast<uint64_t>(shader_type) << 32) |
++         static_cast<uint64_t>(precision_type);
++}
++
+ std::atomic<bool> g_audio_noise_enabled{true};
+ std::atomic<bool> g_audio_noise_set{false};
+ 
+@@ -502,6 +550,162 @@ std::vector<std::string> FingerprintState::WebGLExtensions() {
+   return out;
+ }
+ 
++// static
++void FingerprintState::SetWebGLParams(std::string_view tsv_blob) {
++  if (g_webgl_params_set.load(std::memory_order_acquire)) {
++    return;  // first-set-wins; same first-frame discipline as the seed.
++  }
++  if (tsv_blob.empty()) {
++    return;
++  }
++  auto& int_map = WebGLIntStorage();
++  auto& int_range_map = WebGLIntRangeStorage();
++  auto& float_range_map = WebGLFloatRangeStorage();
++  auto& prec_map = WebGLPrecisionStorage();
++
++  auto parse_u32 = [](std::string_view s, uint32_t* out) -> bool {
++    if (s.empty()) return false;
++    // Accept 0x-prefixed hex or plain decimal — the packer in
++    // handlers_chronium picks whichever the source profile uses.
++    int base = 10;
++    if (s.size() > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
++      s.remove_prefix(2);
++      base = 16;
++    }
++    uint32_t v = 0;
++    for (char c : s) {
++      uint32_t digit = 0;
++      if (c >= '0' && c <= '9') digit = c - '0';
++      else if (base == 16 && c >= 'a' && c <= 'f') digit = 10 + (c - 'a');
++      else if (base == 16 && c >= 'A' && c <= 'F') digit = 10 + (c - 'A');
++      else return false;
++      v = v * base + digit;
++    }
++    *out = v;
++    return true;
++  };
++  auto parse_i64 = [](std::string_view s, int64_t* out) -> bool {
++    if (s.empty()) return false;
++    int64_t sign = 1;
++    if (s[0] == '-') { sign = -1; s.remove_prefix(1); }
++    int64_t v = 0;
++    for (char c : s) {
++      if (c < '0' || c > '9') return false;
++      v = v * 10 + (c - '0');
++    }
++    *out = sign * v;
++    return true;
++  };
++  auto parse_i32 = [&](std::string_view s, int32_t* out) -> bool {
++    int64_t v = 0;
++    if (!parse_i64(s, &v)) return false;
++    *out = static_cast<int32_t>(v);
++    return true;
++  };
++  auto parse_f32 = [](std::string_view s, float* out) -> bool {
++    if (s.empty()) return false;
++    double v = 0.0;
++    if (!base::StringToDouble(std::string(s), &v)) return false;
++    *out = static_cast<float>(v);
++    return true;
++  };
++
++  size_t pos = 0;
++  while (pos < tsv_blob.size()) {
++    size_t end = tsv_blob.find('\n', pos);
++    if (end == std::string::npos) end = tsv_blob.size();
++    std::string_view line = tsv_blob.substr(pos, end - pos);
++    pos = end + 1;
++    if (line.empty()) continue;
++
++    // Split into fields on '\t'.
++    std::vector<std::string_view> fields;
++    size_t fp = 0;
++    while (fp <= line.size()) {
++      size_t fe = line.find('\t', fp);
++      if (fe == std::string_view::npos) fe = line.size();
++      fields.push_back(line.substr(fp, fe - fp));
++      fp = fe + 1;
++    }
++    if (fields.size() < 3) continue;
++
++    const std::string_view tag = fields[0];
++    if (tag == "i" && fields.size() == 3) {
++      uint32_t pname;
++      int64_t value;
++      if (parse_u32(fields[1], &pname) && parse_i64(fields[2], &value)) {
++        int_map[pname] = value;
++      }
++    } else if (tag == "ir" && fields.size() == 4) {
++      uint32_t pname;
++      int32_t a, b;
++      if (parse_u32(fields[1], &pname) && parse_i32(fields[2], &a) &&
++          parse_i32(fields[3], &b)) {
++        int_range_map[pname] = std::make_pair(a, b);
++      }
++    } else if (tag == "fr" && fields.size() == 4) {
++      uint32_t pname;
++      float a, b;
++      if (parse_u32(fields[1], &pname) && parse_f32(fields[2], &a) &&
++          parse_f32(fields[3], &b)) {
++        float_range_map[pname] = std::make_pair(a, b);
++      }
++    } else if (tag == "sp" && fields.size() == 6) {
++      uint32_t shader, prec;
++      int32_t rmin, rmax, p;
++      if (parse_u32(fields[1], &shader) && parse_u32(fields[2], &prec) &&
++          parse_i32(fields[3], &rmin) && parse_i32(fields[4], &rmax) &&
++          parse_i32(fields[5], &p)) {
++        prec_map[PrecisionKey(shader, prec)] = std::make_tuple(rmin, rmax, p);
++      }
++    }
++  }
++  g_webgl_params_set.store(true, std::memory_order_release);
++}
++
++// static
++int64_t FingerprintState::WebGLIntParam(uint32_t pname) {
++  if (!g_webgl_params_set.load(std::memory_order_acquire)) {
++    return -1;
++  }
++  const auto& m = WebGLIntStorage();
++  auto it = m.find(pname);
++  return it == m.end() ? -1 : it->second;
++}
++
++// static
++std::pair<int32_t, int32_t> FingerprintState::WebGLIntRangeParam(
++    uint32_t pname) {
++  if (!g_webgl_params_set.load(std::memory_order_acquire)) {
++    return std::make_pair(INT32_MIN, INT32_MIN);
++  }
++  const auto& m = WebGLIntRangeStorage();
++  auto it = m.find(pname);
++  return it == m.end() ? std::make_pair(INT32_MIN, INT32_MIN) : it->second;
++}
++
++// static
++std::pair<float, float> FingerprintState::WebGLFloatRangeParam(
++    uint32_t pname) {
++  if (!g_webgl_params_set.load(std::memory_order_acquire)) {
++    return std::make_pair(-1.0f, -1.0f);
++  }
++  const auto& m = WebGLFloatRangeStorage();
++  auto it = m.find(pname);
++  return it == m.end() ? std::make_pair(-1.0f, -1.0f) : it->second;
++}
++
++// static
++std::tuple<int32_t, int32_t, int32_t> FingerprintState::WebGLShaderPrecision(
++    uint32_t shader_type, uint32_t precision_type) {
++  if (!g_webgl_params_set.load(std::memory_order_acquire)) {
++    return std::make_tuple(0, 0, -1);
++  }
++  const auto& m = WebGLPrecisionStorage();
++  auto it = m.find(PrecisionKey(shader_type, precision_type));
++  return it == m.end() ? std::make_tuple(0, 0, -1) : it->second;
++}
++
+ // static
+ void FingerprintState::SetAudioNoise(bool enabled) {
+   g_audio_noise_enabled.store(enabled, std::memory_order_release);
+diff --git a/third_party/blink/renderer/platform/fingerprint/fingerprint_state.h b/third_party/blink/renderer/platform/fingerprint/fingerprint_state.h
+index 8c200cf8e7174..1f16f7c39941a 100644
+--- a/third_party/blink/renderer/platform/fingerprint/fingerprint_state.h
++++ b/third_party/blink/renderer/platform/fingerprint/fingerprint_state.h
+@@ -19,6 +19,8 @@
+ #include <cstdint>
+ #include <string>
+ #include <string_view>
++#include <tuple>
++#include <utility>
+ #include <vector>
+ 
+ #include "third_party/blink/renderer/platform/platform_export.h"
+@@ -151,6 +153,35 @@ class PLATFORM_EXPORT FingerprintState {
+   static void SetWebGLLimits(const WebGLLimitsFp& limits);
+   static const WebGLLimitsFp* WebGLLimits();
+ 
++  // Full WebGL parameter surface — covers everything getParameter() can
++  // probe that fingerprints behavior of the underlying driver. Pattern:
++  // the browser side passes a TSV blob over a single switch
++  // (--fingerprint-webgl-params=...) once at process start; we parse
++  // into in-memory maps and the getParameter override consults them
++  // before any GL roundtrip. Three value shapes show up in the spec:
++  //   * single int  (MAX_TEXTURE_SIZE, MAX_VERTEX_ATTRIBS, …)
++  //   * int range   (MAX_VIEWPORT_DIMS — 2 ints)
++  //   * float range (ALIASED_LINE_WIDTH_RANGE, ALIASED_POINT_SIZE_RANGE)
++  //
++  // Blob format (one entry per line, tab-separated):
++  //   i\t<pname-hex>\t<int-value>
++  //   ir\t<pname-hex>\t<int1>\t<int2>
++  //   fr\t<pname-hex>\t<float1>\t<float2>
++  //   sp\t<shader-type-hex>\t<precision-type-hex>\t<range-min>\t<range-max>\t<precision>
++  //
++  // Lookups return sentinel "not set" values so the getParameter
++  // override can fall through to the real driver call unchanged:
++  //   WebGLIntParam       -> -1
++  //   WebGLIntRangeParam  -> (INT32_MIN, INT32_MIN)
++  //   WebGLFloatRangeParam-> (-1.0f, -1.0f)
++  //   WebGLShaderPrecision-> (_, _, -1)
++  static void SetWebGLParams(std::string_view tsv_blob);
++  static int64_t WebGLIntParam(uint32_t pname);
++  static std::pair<int32_t, int32_t> WebGLIntRangeParam(uint32_t pname);
++  static std::pair<float, float> WebGLFloatRangeParam(uint32_t pname);
++  static std::tuple<int32_t, int32_t, int32_t> WebGLShaderPrecision(
++      uint32_t shader_type, uint32_t precision_type);
++
+   // WebAuthn isUserVerifyingPlatformAuthenticatorAvailable() result.
+   // Real devices return true on machines with Windows Hello / Touch ID /
+   // platform-bound credentials, false otherwise. Bots that just spoof
+-- 
+2.54.0.windows.1
+

@@ -49,47 +49,34 @@ Write-Host "[2/6] Copying chronium binary..." -ForegroundColor Cyan
 $BinDir = Join-Path $Staging 'bin'
 New-Item -ItemType Directory -Path $BinDir -Force | Out-Null
 
-# Only the runtime files chronium.exe needs to start. Everything else
-# in out/Release (unittest binaries, helper exes, debug DLLs) is from
-# build-time and bloats the package to nearly 2 GB. Real Chrome stable
-# distributes the same shortlist below.
-$RuntimeFiles = @(
-    # Main executables.
-    'chrome.exe', 'chrome_proxy.exe', 'chrome_pwa_launcher.exe',
-    # Core DLLs.
-    'chrome.dll', 'chrome_elf.dll', 'dbghelp.dll',
-    # GPU + graphics stack.
-    'libGLESv2.dll', 'libEGL.dll',
-    'd3dcompiler_47.dll', 'dxcompiler.dll', 'dxil.dll',
-    'vulkan-1.dll', 'vk_swiftshader.dll', 'vk_swiftshader_icd.json',
-    # Resource paks + ICU data + V8 snapshot.
-    'resources.pak', 'chrome_100_percent.pak', 'chrome_200_percent.pak',
-    'icudtl.dat',
-    'snapshot_blob.bin', 'v8_context_snapshot.bin'
-)
-foreach ($f in $RuntimeFiles) {
-    $src = Join-Path $ReleaseSrc $f
-    if (Test-Path $src) {
-        Copy-Item -Path $src -Destination $BinDir -Force
-    }
+# Component build ships ~586 separate DLLs that chrome.exe loads at
+# runtime, so the old "shortlist that real Chrome distributes" approach
+# doesn't work — every component_*_*.dll needs to be present or the
+# loader fails with WinError 14001 (side-by-side configuration is
+# incorrect). Mirror the entire Release/ tree minus build-time
+# artifacts (pdb / lib / obj / siso traces) instead.
+#
+# DO NOT rename chrome.exe → chronium.exe: Chrome's embedded manifest
+# pins chrome.exe in several SxS assembly references; renaming triggers
+# the SxS error on launch.
+Write-Host "    mirroring Release/ -> bin/ (component build needs ~600 DLLs)"
+robocopy $ReleaseSrc $BinDir /E `
+    /XF "*.pdb" "*.lib" "*.o" "*.obj" "*.tlog" "*.ilk" `
+        "siso_metrics*.json" "siso_trace*.json" "package.json" `
+        "args.gn" "args.gn.d" "build.ninja" "build.ninja.d" `
+        "toolchain.ninja" ".ninja_log" ".ninja_deps" `
+    /XD "obj" "gen" `
+    /NFL /NDL /NJH /NJS /NP /NS | Out-Null
+if ($LASTEXITCODE -ge 8) {
+    Write-Error "robocopy failed with exit $LASTEXITCODE"
+    exit $LASTEXITCODE
 }
+# robocopy returns 1-7 for successful copies, only >=8 is a real error.
+$LASTEXITCODE = 0
 
-# Subdirectories chrome.dll needs at runtime.
-foreach ($sub in @('Locales', 'resources', 'swiftshader', 'MEIPreload', 'WidevineCdm')) {
-    $srcSub = Join-Path $ReleaseSrc $sub
-    if (Test-Path $srcSub) {
-        Copy-Item -Path $srcSub -Destination $BinDir -Recurse -Force
-    }
-}
-
-# Rename chrome.exe -> chronium.exe (cosmetic).
-$ChromeExe = Join-Path $BinDir 'chrome.exe'
-$ChroniumExe = Join-Path $BinDir 'chronium.exe'
-if (Test-Path $ChromeExe) {
-    Move-Item -Path $ChromeExe -Destination $ChroniumExe -Force
-}
 $binSize = (Get-ChildItem $BinDir -Recurse | Measure-Object Length -Sum).Sum / 1MB
-Write-Host "    bin/ size: $([math]::Round($binSize,1)) MB"
+$fileCount = (Get-ChildItem $BinDir -Recurse -File).Count
+Write-Host "    bin/ size: $([math]::Round($binSize,1)) MB ($fileCount files)"
 
 # --- Copy fingerprint profiles ---
 Write-Host "[3/6] Copying 170 fingerprint profiles..." -ForegroundColor Cyan
