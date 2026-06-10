@@ -1,0 +1,94 @@
+{
+  "schema_version": 1,
+  "seed": "0f3a8b6c1d2e4f5a90b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3",
+  "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+  "user_agent_data": {
+    "brands": [
+      { "brand": "Chromium",       "version": "130" },
+      { "brand": "Google Chrome",  "version": "130" },
+      { "brand": "Not?A_Brand",    "version": "99"  }
+    ],
+    "full_version_list": [
+      { "brand": "Chromium",       "version": "130.0.6723.117" },
+      { "brand": "Google Chrome",  "version": "130.0.6723.117" },
+      { "brand": "Not?A_Brand",    "version": "99.0.0.0"       }
+    ],
+    "platform":        "Windows",
+    "platform_version":"15.0.0",
+    "architecture":    "x86",
+    "bitness":         "64",
+    "model":           "",
+    "mobile":          false,
+    "wow64":           false
+  },
+  "platform": "Win32",
+  "vendor": "Google Inc.",
+  "accept_language": "en-US,en;q=0.9",
+  "languages": ["en-US", "en"],
+  "screen": {
+    "width": 1920,
+    "height": 1080,
+    "avail_width": 1920,
+    "avail_height": 1040,
+    "color_depth": 24,
+    "pixel_depth": 24,
+    "device_pixel_ratio": 1.0
+  },
+  "hardware_concurrency": 8,
+  "device_memory": 8,
+  "max_touch_points": 0,
+  "timezone": "America/New_York",
+  "locale": "en-US",
+  "geolocation": {
+    "latitude": 40.7128,
+    "longitude": -74.006,
+    "accuracy": 100
+  },
+  "webgl": {
+    "vendor":            "Google Inc. (NVIDIA)",
+    "renderer":          "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+    "unmasked_vendor":   "NVIDIA Corporation",
+    "unmasked_renderer": "NVIDIA GeForce RTX 3060/PCIe/SSE2",
+    "version":           "WebGL 2.0 (OpenGL ES 3.0 Chromium)"
+  },
+  "fonts": [
+    "Arial", "Arial Black", "Calibri", "Cambria", "Cambria Math",
+    "Comic Sans MS", "Consolas", "Courier New", "Georgia", "Impact",
+    "Lucida Console", "Microsoft Sans Serif", "Segoe UI", "Tahoma",
+    "Times New Roman", "Trebuchet MS", "Verdana", "Webdings"
+  ],
+  "plugins": [
+    {
+      "name":        "PDF Viewer",
+      "description": "Portable Document Format",
+      "filename":    "internal-pdf-viewer"
+    },
+    {
+      "name":        "Chrome PDF Viewer",
+      "description": "Portable Document Format",
+      "filename":    "internal-pdf-viewer"
+    }
+  ],
+  "mime_types": [
+    { "type": "application/pdf", "suffixes": "pdf", "description": "Portable Document Format" }
+  ],
+  "media_devices": [
+    { "kind": "audioinput",  "label": "Default - Microphone (Realtek Audio)" },
+    { "kind": "audiooutput", "label": "Default - Speakers (Realtek Audio)"   },
+    { "kind": "videoinput",  "label": "Integrated Camera"                    }
+  ],
+  "battery": {
+    "level": 0.87,
+    "charging": true,
+    "charging_time": null,
+    "discharging_time": null
+  },
+  "webrtc_policy": "proxy_only",
+  "noise": {
+    "canvas_threshold":      0.001,
+    "webgl_readpixels":      true,
+    "audio_amplitude":       1e-7,
+    "clientrects_subpixel":  1e-5,
+    "measure_text_subpixel": 1e-5
+  }
+}

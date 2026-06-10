@@ -1,0 +1,308 @@
+From d6b15f97521d798df47fd45453dc77e34fb88202 Mon Sep 17 00:00:00 2001
+From: Chronium Build <chronium@interlink.local>
+Date: Fri, 5 Jun 2026 18:04:57 +0700
+Subject: [PATCH 06/14] chronium: per-profile navigator.userAgent +
+ navigator.platform + HTTP UA
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Targets plan §0.2 (login persistence): the JS-exposed user agent
+string and the HTTP User-Agent header now match exactly and both
+follow the per-profile JSON config. This is the single most
+important consistency for not getting flagged by Google's risk
+engine on Gmail / Account / YouTube.
+
+Approach: piggyback on Chromium's existing --user-agent flag rather
+than adding a parallel path. At browser startup
+(PreCreateThreadsImpl, after FingerprintProfile loads the JSON) we
+promote the profile's 'user_agent' field into
+embedder_support::kUserAgent. Chromium's own user-agent plumbing
+then handles BOTH the HTTP User-Agent header (via
+user_agent_utils) AND the JS navigator.userAgent value, and the
+existing AppendExtraCommandLineSwitches copy of kUserAgent in
+kCommonSwitchNames carries it to every child process. Zero new code
+in the user-agent generation path.
+
+navigator.platform is patched in Blink directly because the only
+existing override path (Settings::GetNavigatorPlatformOverride) is
+DevTools-driven and reachable only after a DOM window exists. We
+add a Chronium-priority check at the top of Navigator::platform()
+that reads from blink::FingerprintState. The state is populated in
+RenderThreadStarted from --fingerprint-platform, which the browser
+appends from the JSON 'platform' field via
+AppendExtraCommandLineSwitches (same pattern as the existing WebGL
+vendor/renderer propagation).
+
+navigator.vendor is intentionally NOT spoofed: Chrome hardcodes
+'Google Inc.' for legacy compat and fingerprinters expect that
+constant alongside a Chrome-shaped UA. Spoofing it would create a
+detectable inconsistency.
+
+Verified end-to-end on a httpbin echo:
+  profile A (Windows JSON):
+    navigator.userAgent : Mozilla/5.0 (Windows NT 10.0; Win64; x64) ...
+    navigator.platform  : Win32
+    HTTP User-Agent     : <identical to navigator.userAgent>
+  profile B (Mac JSON):
+    navigator.userAgent : Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) ...
+    navigator.platform  : MacIntel
+    HTTP User-Agent     : <identical to navigator.userAgent>
+
+Files touched:
+- chrome/common/chrome_switches.{h,cc}                 (kFingerprintPlatform)
+- chrome/browser/fingerprint/fingerprint_profile.{h,cc}
+                                                       (UserAgent/Platform accessors)
+- chrome/browser/chrome_browser_main.cc                (promote ua into kUserAgent)
+- chrome/browser/chrome_content_browser_client.cc      (propagate platform switch)
+- chrome/renderer/chrome_content_renderer_client.cc    (install platform on RT start)
+- third_party/blink/renderer/platform/fingerprint/
+    fingerprint_state.{h,cc}                           (SetPlatform/Platform)
+- third_party/blink/renderer/core/frame/navigator.cc   (override platform())
+---
+ chrome/browser/chrome_browser_main.cc         | 20 +++++++++++++---
+ .../browser/chrome_content_browser_client.cc  |  5 ++++
+ .../fingerprint/fingerprint_profile.cc        | 16 +++++++++++++
+ .../browser/fingerprint/fingerprint_profile.h |  6 +++++
+ chrome/common/chrome_switches.cc              |  3 +++
+ chrome/common/chrome_switches.h               |  6 +++++
+ .../chrome_content_renderer_client.cc         |  5 ++++
+ .../blink/renderer/core/frame/navigator.cc    |  6 +++++
+ .../platform/fingerprint/fingerprint_state.cc | 23 +++++++++++++++++++
+ .../platform/fingerprint/fingerprint_state.h  |  5 ++++
+ 10 files changed, 92 insertions(+), 3 deletions(-)
+
+diff --git a/chrome/browser/chrome_browser_main.cc b/chrome/browser/chrome_browser_main.cc
+index 09c4540b4336f..62d0efc258821 100644
+--- a/chrome/browser/chrome_browser_main.cc
++++ b/chrome/browser/chrome_browser_main.cc
+@@ -40,6 +40,8 @@
+ #include "chrome/browser/enterprise/chrome_browser_main_extra_parts_enterprise.h"
+ #include "chrome/browser/fingerprint/fingerprint_profile.h"
+ #include "chrome/browser/first_run/bookmark_importer.h"
++// IWYU pragma: keep — embedder_support/switches.h provides kUserAgent.
++#include "components/embedder_support/switches.h"
+ #include "chrome/browser/first_run/first_run_features.h"
+ #include "chrome/browser/gpu/chrome_browser_main_extra_parts_gpu.h"
+ #include "chrome/browser/language/url_language_histogram_factory.h"
+@@ -1210,11 +1212,23 @@ int ChromeBrowserMainParts::PreCreateThreadsImpl() {
+   // singletons see it. Missing/malformed file is non-fatal — patches fall
+   // back to default behavior when FingerprintProfile::IsLoaded() is false.
+   {
+-    const base::CommandLine* cmd_line =
+-        base::CommandLine::ForCurrentProcess();
++    base::CommandLine* cmd_line = base::CommandLine::ForCurrentProcess();
+     if (cmd_line->HasSwitch(switches::kFingerprintProfile)) {
+-      chronium::FingerprintProfile::GetInstance()->LoadFromFile(
++      auto* fp = chronium::FingerprintProfile::GetInstance();
++      fp->LoadFromFile(
+           cmd_line->GetSwitchValuePath(switches::kFingerprintProfile));
++      // Promote the JSON user_agent into the existing --user-agent flag
++      // (embedder_support::kUserAgent). Chromium's user-agent plumbing
++      // then handles both HTTP User-Agent header generation and the JS
++      // navigator.userAgent value, and propagates to child processes via
++      // the kCommonSwitchNames copy in AppendExtraCommandLineSwitches.
++      if (fp->IsLoaded()) {
++        const std::string ua = fp->UserAgent();
++        if (!ua.empty() &&
++            !cmd_line->HasSwitch(embedder_support::kUserAgent)) {
++          cmd_line->AppendSwitchASCII(embedder_support::kUserAgent, ua);
++        }
++      }
+     }
+   }
+ 
+diff --git a/chrome/browser/chrome_content_browser_client.cc b/chrome/browser/chrome_content_browser_client.cc
+index 8ba037c460f39..1feff0d1fd7ad 100644
+--- a/chrome/browser/chrome_content_browser_client.cc
++++ b/chrome/browser/chrome_content_browser_client.cc
+@@ -2821,6 +2821,11 @@ void ChromeContentBrowserClient::AppendExtraCommandLineSwitches(
+         command_line->AppendSwitchASCII(switches::kFingerprintWebGLRenderer,
+                                         webgl_renderer);
+       }
++      const std::string platform = fp->Platform();
++      if (!platform.empty()) {
++        command_line->AppendSwitchASCII(switches::kFingerprintPlatform,
++                                        platform);
++      }
+     }
+   }
+ #if BUILDFLAG(IS_MAC)
+diff --git a/chrome/browser/fingerprint/fingerprint_profile.cc b/chrome/browser/fingerprint/fingerprint_profile.cc
+index 43f44f8f71b2a..fff9735d62311 100644
+--- a/chrome/browser/fingerprint/fingerprint_profile.cc
++++ b/chrome/browser/fingerprint/fingerprint_profile.cc
+@@ -88,6 +88,22 @@ std::string FingerprintProfile::WebGLUnmaskedRenderer() const {
+   return s ? *s : std::string();
+ }
+ 
++std::string FingerprintProfile::UserAgent() const {
++  if (!loaded_) {
++    return {};
++  }
++  const std::string* s = dict_.FindString("user_agent");
++  return s ? *s : std::string();
++}
++
++std::string FingerprintProfile::Platform() const {
++  if (!loaded_) {
++    return {};
++  }
++  const std::string* s = dict_.FindString("platform");
++  return s ? *s : std::string();
++}
++
+ bool FingerprintProfile::LoadFromFile(const base::FilePath& path) {
+   std::string contents;
+   if (!base::ReadFileToString(path, &contents)) {
+diff --git a/chrome/browser/fingerprint/fingerprint_profile.h b/chrome/browser/fingerprint/fingerprint_profile.h
+index eef348904783c..3915b2db375ad 100644
+--- a/chrome/browser/fingerprint/fingerprint_profile.h
++++ b/chrome/browser/fingerprint/fingerprint_profile.h
+@@ -69,6 +69,12 @@ class FingerprintProfile : public chrome::mojom::FingerprintConfigProvider {
+   std::string WebGLUnmaskedVendor() const;
+   std::string WebGLUnmaskedRenderer() const;
+ 
++  // navigator.userAgent / HTTP User-Agent. Empty = no override.
++  std::string UserAgent() const;
++
++  // navigator.platform. Empty = no override.
++  std::string Platform() const;
++
+  private:
+   friend class base::NoDestructor<FingerprintProfile>;
+   FingerprintProfile();
+diff --git a/chrome/common/chrome_switches.cc b/chrome/common/chrome_switches.cc
+index 0ee803d9014a9..09a0725525350 100644
+--- a/chrome/common/chrome_switches.cc
++++ b/chrome/common/chrome_switches.cc
+@@ -358,6 +358,9 @@ const char kFingerprintSeedHex[] = "fingerprint-seed-hex";
+ const char kFingerprintWebGLVendor[] = "fingerprint-webgl-vendor";
+ const char kFingerprintWebGLRenderer[] = "fingerprint-webgl-renderer";
+ 
++// Chronium (internal): navigator.platform override.
++const char kFingerprintPlatform[] = "fingerprint-platform";
++
+ // Does not show the crash restore bubble when the browser is started during the
+ // system startup phase in ChromeOS, if the ChromeOS full restore feature is
+ // enabled, because the ChromeOS full restore notification is shown for the user
+diff --git a/chrome/common/chrome_switches.h b/chrome/common/chrome_switches.h
+index a610f27250215..9023e9a55ccf9 100644
+--- a/chrome/common/chrome_switches.h
++++ b/chrome/common/chrome_switches.h
+@@ -139,6 +139,12 @@ extern const char kFingerprintSeedHex[];
+ extern const char kFingerprintWebGLVendor[];
+ extern const char kFingerprintWebGLRenderer[];
+ 
++// Chronium (internal): per-profile spoofed navigator.platform value.
++// (navigator.userAgent and HTTP User-Agent are handled by the existing
++// --user-agent flag, which Chronium auto-attaches from the profile JSON
++// at browser startup.)
++extern const char kFingerprintPlatform[];
++
+ extern const char kHideCrashRestoreBubble[];
+ extern const char kHomePage[];
+ #if !BUILDFLAG(IS_ANDROID)
+diff --git a/chrome/renderer/chrome_content_renderer_client.cc b/chrome/renderer/chrome_content_renderer_client.cc
+index 351c491de17e1..d1a7ba4e653a6 100644
+--- a/chrome/renderer/chrome_content_renderer_client.cc
++++ b/chrome/renderer/chrome_content_renderer_client.cc
+@@ -403,6 +403,11 @@ void ChromeContentRendererClient::RenderThreadStarted() {
+     if (!webgl_vendor.empty() || !webgl_renderer.empty()) {
+       blink::FingerprintState::SetWebGLStrings(webgl_vendor, webgl_renderer);
+     }
++    const std::string platform =
++        cmd_line->GetSwitchValueASCII(switches::kFingerprintPlatform);
++    if (!platform.empty()) {
++      blink::FingerprintState::SetPlatform(platform);
++    }
+   }
+ 
+   main_thread_profiler_->SetAuxUnwinderFactory(base::BindRepeating(
+diff --git a/third_party/blink/renderer/core/frame/navigator.cc b/third_party/blink/renderer/core/frame/navigator.cc
+index 583f05f8dd5fb..806af2d1d9149 100644
+--- a/third_party/blink/renderer/core/frame/navigator.cc
++++ b/third_party/blink/renderer/core/frame/navigator.cc
+@@ -32,6 +32,7 @@
+ #include "third_party/blink/renderer/core/inspector/console_message.h"
+ #include "third_party/blink/renderer/core/loader/frame_loader.h"
+ #include "third_party/blink/renderer/core/page/page.h"
++#include "third_party/blink/renderer/platform/fingerprint/fingerprint_state.h"
+ #include "third_party/blink/renderer/core/probe/core_probes.h"
+ #include "third_party/blink/renderer/platform/language.h"
+ 
+@@ -56,6 +57,11 @@ String Navigator::vendorSub() const {
+ }
+ 
+ String Navigator::platform() const {
++  // Chronium: per-profile spoof has highest priority.
++  std::string_view chronium_platform = FingerprintState::Platform();
++  if (!chronium_platform.empty()) {
++    return String(chronium_platform);
++  }
+   // TODO(955620): Consider changing devtools overrides to only allow overriding
+   // the platform with a frozen platform to distinguish between
+   // mobile and desktop when ReduceUserAgent is enabled.
+diff --git a/third_party/blink/renderer/platform/fingerprint/fingerprint_state.cc b/third_party/blink/renderer/platform/fingerprint/fingerprint_state.cc
+index 40299adcc9b83..74f2c7e486aad 100644
+--- a/third_party/blink/renderer/platform/fingerprint/fingerprint_state.cc
++++ b/third_party/blink/renderer/platform/fingerprint/fingerprint_state.cc
+@@ -33,6 +33,12 @@ std::string& WebGLRendererStorage() {
+ }
+ std::atomic<bool> g_webgl_set{false};
+ 
++std::string& PlatformStorage() {
++  static base::NoDestructor<std::string> s;
++  return *s;
++}
++std::atomic<bool> g_platform_set{false};
++
+ // xxHash-style scalar mix. Cryptographically weak but plenty good for
+ // distinguishing fingerprints. Deterministic for the same (seed, channel,
+ // x, y) tuple.
+@@ -112,6 +118,23 @@ std::string_view FingerprintState::WebGLUnmaskedRenderer() {
+   return WebGLRendererStorage();
+ }
+ 
++// static
++void FingerprintState::SetPlatform(std::string_view platform) {
++  if (g_platform_set.load(std::memory_order_acquire) || platform.empty()) {
++    return;
++  }
++  PlatformStorage().assign(platform);
++  g_platform_set.store(true, std::memory_order_release);
++}
++
++// static
++std::string_view FingerprintState::Platform() {
++  if (!g_platform_set.load(std::memory_order_acquire)) {
++    return {};
++  }
++  return PlatformStorage();
++}
++
+ // static
+ uint32_t FingerprintState::HashAt(std::string_view channel,
+                                   uint32_t x,
+diff --git a/third_party/blink/renderer/platform/fingerprint/fingerprint_state.h b/third_party/blink/renderer/platform/fingerprint/fingerprint_state.h
+index bcf852d88dce6..6b75aa527409b 100644
+--- a/third_party/blink/renderer/platform/fingerprint/fingerprint_state.h
++++ b/third_party/blink/renderer/platform/fingerprint/fingerprint_state.h
+@@ -41,9 +41,14 @@ class PLATFORM_EXPORT FingerprintState {
+   // check this and fall back to default behavior when false.
+   static bool IsActive();
+ 
++  // Sets the navigator.platform override. Empty value = no override.
++  // First setter wins.
++  static void SetPlatform(std::string_view platform);
++
+   // Empty when no override is in effect.
+   static std::string_view WebGLUnmaskedVendor();
+   static std::string_view WebGLUnmaskedRenderer();
++  static std::string_view Platform();
+ 
+   // Deterministic 32-bit hash of (process seed, channel, x, y).
+   // |channel| should be a short stable string identifying the fingerprint
+-- 
+2.54.0.windows.1
+

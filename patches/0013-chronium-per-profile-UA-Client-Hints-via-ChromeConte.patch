@@ -1,0 +1,182 @@
+From 0b036c348c388f8466ccbf8a507f737771569853 Mon Sep 17 00:00:00 2001
+From: Chronium Build <chronium@interlink.local>
+Date: Mon, 8 Jun 2026 11:35:28 +0700
+Subject: [PATCH 13/14] chronium: per-profile UA Client Hints via
+ ChromeContentBrowserClient::GetUserAgentMetadata override
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Plan §5 #6 'Navigator + UA-CH' and §0.2 root cause #2 'UA / UA-CH
+mismatch HTTP vs JS' — the highest-leverage Google-detect win short
+of TLS/JA3 work. The override is a single seam: Chromium fans the
+returned UserAgentMetadata out to every Sec-CH-UA-* request header
+in the network service AND to navigator.userAgentData /
+userAgentData.getHighEntropyValues() on the JS side, so one hook
+fixes both.
+
+FingerprintProfile::UserAgentMetadata
+  Parses the profile JSON's 'user_agent_data' dict into a
+  blink::UserAgentMetadata:
+   - brand_version_list      <- 'brands' array
+   - brand_full_version_list <- 'full_version_list' array
+   - platform, platform_version, architecture, bitness, model,
+     mobile, wow64           <- their respective JSON keys
+   - full_version            <- first entry's version from
+                                full_version_list (matches what
+                                Chromium derives internally)
+  Returns std::nullopt when the field is absent, signalling
+  ChromeContentBrowserClient to fall back to the embedder default.
+
+ChromeContentBrowserClient::GetUserAgentMetadata
+  Plugs the profile-provided metadata in when a profile is loaded,
+  before delegating to embedder_support::GetUserAgentMetadata.
+
+Pair this with the existing patch 0006 --user-agent attach: that
+patch handled the legacy User-Agent string and JS
+navigator.userAgent; this patch handles every modern Sec-CH-UA-*
+plus navigator.userAgentData. They share their source (the JSON
+profile) so consistency between the two is enforced by config —
+if you set 'user_agent' to a Windows UA and 'user_agent_data' to
+macOS, the mismatch is visible in the JSON itself.
+
+Verified on profile B (macOS user_agent + macOS user_agent_data):
+  JS getHighEntropyValues   -> platform 'macOS', platformVersion
+                               '14.5.0', architecture 'arm',
+                               bitness '64'
+  HTTP User-Agent header    -> 'Mozilla/5.0 (Macintosh; Intel Mac
+                               OS X 10_15_7) ...'
+  HTTP Sec-Ch-Ua-Platform   -> '"macOS"'
+  HTTP Sec-Ch-Ua-Mobile     -> '?0'
+  HTTP Sec-Ch-Ua            -> '"Chromium";v="130", "Google
+                               Chrome";v="130", "Not?A_Brand"
+                               ;v="99"'
+
+Files touched:
+- chrome/browser/fingerprint/fingerprint_profile.{h,cc}
+- chrome/browser/chrome_content_browser_client.cc
+---
+ .../browser/chrome_content_browser_client.cc  | 10 ++++
+ .../fingerprint/fingerprint_profile.cc        | 51 +++++++++++++++++++
+ .../browser/fingerprint/fingerprint_profile.h |  9 ++++
+ 3 files changed, 70 insertions(+)
+
+diff --git a/chrome/browser/chrome_content_browser_client.cc b/chrome/browser/chrome_content_browser_client.cc
+index b4807537b5f99..eb79edfb0dbcc 100644
+--- a/chrome/browser/chrome_content_browser_client.cc
++++ b/chrome/browser/chrome_content_browser_client.cc
+@@ -7561,6 +7561,16 @@ std::string ChromeContentBrowserClient::GetUserAgent() {
+ 
+ blink::UserAgentMetadata ChromeContentBrowserClient::GetUserAgentMetadata() {
+   DCHECK_CURRENTLY_ON(BrowserThread::UI);
++  // Chronium: per-profile Sec-CH-UA-* spoof. The returned metadata drives
++  // every Sec-CH-UA-* HTTP request header AND navigator.userAgentData.*
++  // / getHighEntropyValues() on the JS side, so this single override
++  // makes them consistent with the spoofed --user-agent automatically.
++  auto* fp = chronium::FingerprintProfile::GetInstance();
++  if (fp->IsLoaded()) {
++    if (auto metadata = fp->UserAgentMetadata()) {
++      return std::move(*metadata);
++    }
++  }
+   return embedder_support::GetUserAgentMetadata();
+ }
+ 
+diff --git a/chrome/browser/fingerprint/fingerprint_profile.cc b/chrome/browser/fingerprint/fingerprint_profile.cc
+index 77f00137c6569..2c8a6cabe14b7 100644
+--- a/chrome/browser/fingerprint/fingerprint_profile.cc
++++ b/chrome/browser/fingerprint/fingerprint_profile.cc
+@@ -185,6 +185,57 @@ std::string FingerprintProfile::Timezone() const {
+   return s ? *s : std::string();
+ }
+ 
++namespace {
++
++// Walks a JSON list of {brand, version} dicts and appends to |out|.
++void AppendBrandList(const base::ListValue* list,
++                     blink::UserAgentBrandList& out) {
++  if (!list) {
++    return;
++  }
++  for (const auto& item : *list) {
++    const base::DictValue* d = item.GetIfDict();
++    if (!d) continue;
++    const std::string* brand = d->FindString("brand");
++    const std::string* version = d->FindString("version");
++    if (brand && version) {
++      out.emplace_back(*brand, *version);
++    }
++  }
++}
++
++}  // namespace
++
++std::optional<blink::UserAgentMetadata>
++FingerprintProfile::UserAgentMetadata() const {
++  if (!loaded_) {
++    return std::nullopt;
++  }
++  const base::DictValue* uad = dict_.FindDict("user_agent_data");
++  if (!uad) {
++    return std::nullopt;
++  }
++  blink::UserAgentMetadata m;
++  AppendBrandList(uad->FindList("brands"), m.brand_version_list);
++  AppendBrandList(uad->FindList("full_version_list"),
++                  m.brand_full_version_list);
++  if (const std::string* s = uad->FindString("platform")) m.platform = *s;
++  if (const std::string* s = uad->FindString("platform_version"))
++    m.platform_version = *s;
++  if (const std::string* s = uad->FindString("architecture"))
++    m.architecture = *s;
++  if (const std::string* s = uad->FindString("bitness")) m.bitness = *s;
++  if (const std::string* s = uad->FindString("model")) m.model = *s;
++  if (std::optional<bool> b = uad->FindBool("mobile")) m.mobile = *b;
++  if (std::optional<bool> b = uad->FindBool("wow64")) m.wow64 = *b;
++  // full_version: derived from the first entry of brand_full_version_list
++  // (Chromium's own brand) — most fingerprinters never read it directly.
++  if (!m.brand_full_version_list.empty()) {
++    m.full_version = m.brand_full_version_list.front().version;
++  }
++  return m;
++}
++
+ std::string FingerprintProfile::AcceptLanguageCsv() const {
+   if (!loaded_) {
+     return {};
+diff --git a/chrome/browser/fingerprint/fingerprint_profile.h b/chrome/browser/fingerprint/fingerprint_profile.h
+index 73ba5b4e5eb9b..fb1d7777fe52a 100644
+--- a/chrome/browser/fingerprint/fingerprint_profile.h
++++ b/chrome/browser/fingerprint/fingerprint_profile.h
+@@ -15,12 +15,15 @@
+ #include <cstdint>
+ #include <string>
+ 
++#include <optional>
++
+ #include "base/files/file_path.h"
+ #include "base/no_destructor.h"
+ #include "base/values.h"
+ #include "chrome/common/fingerprint.mojom.h"
+ #include "mojo/public/cpp/bindings/pending_receiver.h"
+ #include "mojo/public/cpp/bindings/receiver_set.h"
++#include "third_party/blink/public/common/user_agent/user_agent_metadata.h"
+ 
+ namespace content {
+ class RenderFrameHost;
+@@ -94,6 +97,12 @@ class FingerprintProfile : public chrome::mojom::FingerprintConfigProvider {
+   // IANA timezone id. Empty = none.
+   std::string Timezone() const;
+ 
++  // Builds a full blink::UserAgentMetadata from the JSON 'user_agent_data'
++  // dict (brands, platform, architecture, bitness, mobile, wow64,
++  // full_version_list, ...). Returns nullopt when the field is missing,
++  // which signals callers to fall back to Chromium's default metadata.
++  std::optional<blink::UserAgentMetadata> UserAgentMetadata() const;
++
+  private:
+   friend class base::NoDestructor<FingerprintProfile>;
+   FingerprintProfile();
+-- 
+2.54.0.windows.1
+

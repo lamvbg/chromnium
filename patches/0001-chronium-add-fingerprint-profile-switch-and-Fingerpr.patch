@@ -1,0 +1,271 @@
+From f33c756054fb765c421e0977654bbf3ea662f5f4 Mon Sep 17 00:00:00 2001
+From: Chronium Build <chronium@interlink.local>
+Date: Fri, 5 Jun 2026 15:01:17 +0700
+Subject: [PATCH 01/14] chronium: add --fingerprint-profile switch and
+ FingerprintProfile singleton
+
+Adds a new browser-process command-line switch "fingerprint-profile"
+that takes a path to a JSON file. At startup
+(PreCreateThreadsImpl), the JSON is loaded into a NoDestructor
+singleton chronium::FingerprintProfile.
+
+This is the plumbing foundation for all later fingerprint patches
+(canvas noise, WebGL spoof, navigator override, etc.). Each later
+patch will read its config from FingerprintProfile::GetInstance().
+
+When the switch is absent or the file is missing/malformed, the
+singleton stays in 'no profile' mode and downstream patches must
+fall back to default (real) behavior.
+
+Files touched:
+- chrome/browser/fingerprint/fingerprint_profile.{h,cc}  (new)
+- chrome/common/chrome_switches.{h,cc}                   (declare/define switch)
+- chrome/browser/chrome_browser_main.cc                  (load in PreCreateThreadsImpl)
+- chrome/browser/BUILD.gn                                (build the new sources)
+
+Verified: 'chronium' launches, logs 'Loaded fingerprint profile from
+...' to stderr when the switch is passed. UI boots normally.
+---
+ chrome/browser/BUILD.gn                       |  2 +
+ chrome/browser/chrome_browser_main.cc         | 14 ++++
+ .../fingerprint/fingerprint_profile.cc        | 82 +++++++++++++++++++
+ .../browser/fingerprint/fingerprint_profile.h | 61 ++++++++++++++
+ chrome/common/chrome_switches.cc              |  4 +
+ chrome/common/chrome_switches.h               |  4 +
+ 6 files changed, 167 insertions(+)
+ create mode 100644 chrome/browser/fingerprint/fingerprint_profile.cc
+ create mode 100644 chrome/browser/fingerprint/fingerprint_profile.h
+
+diff --git a/chrome/browser/BUILD.gn b/chrome/browser/BUILD.gn
+index 97b17f850c30d..c923a67815459 100644
+--- a/chrome/browser/BUILD.gn
++++ b/chrome/browser/BUILD.gn
+@@ -3469,6 +3469,8 @@ static_library("browser") {
+       "enterprise/signals/context_info_fetcher.h",
+       "enterprise/signals/device_info_fetcher.cc",
+       "enterprise/signals/device_info_fetcher.h",
++      "fingerprint/fingerprint_profile.cc",
++      "fingerprint/fingerprint_profile.h",
+       "first_run/bookmark_importer.cc",
+       "first_run/bookmark_importer.h",
+       "first_run/first_run.cc",
+diff --git a/chrome/browser/chrome_browser_main.cc b/chrome/browser/chrome_browser_main.cc
+index a8ebab6e15ac1..09c4540b4336f 100644
+--- a/chrome/browser/chrome_browser_main.cc
++++ b/chrome/browser/chrome_browser_main.cc
+@@ -38,6 +38,7 @@
+ #include "chrome/browser/component_updater/registration.h"
+ #include "chrome/browser/enterprise/browser_management/management_service_factory.h"
+ #include "chrome/browser/enterprise/chrome_browser_main_extra_parts_enterprise.h"
++#include "chrome/browser/fingerprint/fingerprint_profile.h"
+ #include "chrome/browser/first_run/bookmark_importer.h"
+ #include "chrome/browser/first_run/first_run_features.h"
+ #include "chrome/browser/gpu/chrome_browser_main_extra_parts_gpu.h"
+@@ -1204,6 +1205,19 @@ int ChromeBrowserMainParts::PreCreateThreadsImpl() {
+ 
+   DCHECK(!user_data_dir_.empty());
+ 
++  // Chronium: load per-profile fingerprint config from
++  // --fingerprint-profile=<path> as early as possible so all downstream
++  // singletons see it. Missing/malformed file is non-fatal — patches fall
++  // back to default behavior when FingerprintProfile::IsLoaded() is false.
++  {
++    const base::CommandLine* cmd_line =
++        base::CommandLine::ForCurrentProcess();
++    if (cmd_line->HasSwitch(switches::kFingerprintProfile)) {
++      chronium::FingerprintProfile::GetInstance()->LoadFromFile(
++          cmd_line->GetSwitchValuePath(switches::kFingerprintProfile));
++    }
++  }
++
+   // Force MediaCaptureDevicesDispatcher to be created on UI thread.
+   MediaCaptureDevicesDispatcher::GetInstance();
+ 
+diff --git a/chrome/browser/fingerprint/fingerprint_profile.cc b/chrome/browser/fingerprint/fingerprint_profile.cc
+new file mode 100644
+index 0000000000000..9242345e0d717
+--- /dev/null
++++ b/chrome/browser/fingerprint/fingerprint_profile.cc
+@@ -0,0 +1,82 @@
++// Copyright 2026 The Chronium Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license.
++
++#include "chrome/browser/fingerprint/fingerprint_profile.h"
++
++#include <optional>
++#include <string>
++#include <string_view>
++#include <utility>
++
++#include "base/files/file_util.h"
++#include "base/json/json_reader.h"
++#include "base/logging.h"
++
++namespace chronium {
++
++namespace {
++
++// Parses a 32-byte seed from a 64-character hex string. Accepts lowercase
++// and uppercase. Returns false on malformed input.
++bool ParseSeedHex(std::string_view hex, std::array<uint8_t, 32>& out) {
++  if (hex.size() != 64) {
++    return false;
++  }
++  auto hex_to_nibble = [](char c) -> int {
++    if (c >= '0' && c <= '9') return c - '0';
++    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
++    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
++    return -1;
++  };
++  for (size_t i = 0; i < 32; ++i) {
++    int hi = hex_to_nibble(hex[i * 2]);
++    int lo = hex_to_nibble(hex[i * 2 + 1]);
++    if (hi < 0 || lo < 0) {
++      return false;
++    }
++    out[i] = static_cast<uint8_t>((hi << 4) | lo);
++  }
++  return true;
++}
++
++}  // namespace
++
++// static
++FingerprintProfile* FingerprintProfile::GetInstance() {
++  static base::NoDestructor<FingerprintProfile> instance;
++  return instance.get();
++}
++
++FingerprintProfile::FingerprintProfile() = default;
++FingerprintProfile::~FingerprintProfile() = default;
++
++bool FingerprintProfile::LoadFromFile(const base::FilePath& path) {
++  std::string contents;
++  if (!base::ReadFileToString(path, &contents)) {
++    LOG(WARNING) << "[chronium] Cannot read fingerprint profile at "
++                 << path.value();
++    return false;
++  }
++  std::optional<base::DictValue> parsed =
++      base::JSONReader::ReadDict(contents, base::JSON_PARSE_RFC);
++  if (!parsed) {
++    LOG(WARNING) << "[chronium] Fingerprint profile is not a JSON object: "
++                 << path.value();
++    return false;
++  }
++  dict_ = std::move(*parsed);
++
++  if (const std::string* seed_hex = dict_.FindString("seed")) {
++    if (!ParseSeedHex(*seed_hex, seed_)) {
++      LOG(WARNING) << "[chronium] Fingerprint profile seed must be 64 hex "
++                      "chars; ignoring seed. File: "
++                   << path.value();
++    }
++  }
++
++  loaded_ = true;
++  LOG(INFO) << "[chronium] Loaded fingerprint profile from " << path.value();
++  return true;
++}
++
++}  // namespace chronium
+diff --git a/chrome/browser/fingerprint/fingerprint_profile.h b/chrome/browser/fingerprint/fingerprint_profile.h
+new file mode 100644
+index 0000000000000..b7b252483f4a6
+--- /dev/null
++++ b/chrome/browser/fingerprint/fingerprint_profile.h
+@@ -0,0 +1,61 @@
++// Copyright 2026 The Chronium Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license.
++
++// Browser-process singleton holding per-profile fingerprint configuration
++// loaded once at startup from the JSON file referenced by the
++// --fingerprint-profile=<path> command-line switch.
++//
++// Renderers receive a typed subset of this config via Mojo (patch 0002).
++// Browser-side code reads from this singleton directly via GetInstance().
++
++#ifndef CHROME_BROWSER_FINGERPRINT_FINGERPRINT_PROFILE_H_
++#define CHROME_BROWSER_FINGERPRINT_FINGERPRINT_PROFILE_H_
++
++#include <array>
++#include <cstdint>
++
++#include "base/files/file_path.h"
++#include "base/no_destructor.h"
++#include "base/values.h"
++
++namespace chronium {
++
++class FingerprintProfile {
++ public:
++  static FingerprintProfile* GetInstance();
++
++  FingerprintProfile(const FingerprintProfile&) = delete;
++  FingerprintProfile& operator=(const FingerprintProfile&) = delete;
++
++  // Loads the JSON file at |path|. Called once during browser startup from
++  // ChromeBrowserMainParts::PreCreateThreadsImpl(). Returns true on success.
++  // On failure the singleton stays in "no profile" mode and IsLoaded()
++  // returns false; renderer patches MUST fall back to default behavior.
++  bool LoadFromFile(const base::FilePath& path);
++
++  // True once a JSON file has been successfully loaded.
++  bool IsLoaded() const { return loaded_; }
++
++  // 32-byte seed parsed from the JSON "seed" field. All deterministic noise
++  // generators in renderer patches key off this seed. Returns all-zeros
++  // when IsLoaded() is false.
++  const std::array<uint8_t, 32>& Seed() const { return seed_; }
++
++  // Raw JSON dict for accessors added by later patches. Null when not loaded.
++  const base::DictValue* Dict() const {
++    return loaded_ ? &dict_ : nullptr;
++  }
++
++ private:
++  friend class base::NoDestructor<FingerprintProfile>;
++  FingerprintProfile();
++  ~FingerprintProfile();
++
++  bool loaded_ = false;
++  base::DictValue dict_;
++  std::array<uint8_t, 32> seed_{};
++};
++
++}  // namespace chronium
++
++#endif  // CHROME_BROWSER_FINGERPRINT_FINGERPRINT_PROFILE_H_
+diff --git a/chrome/common/chrome_switches.cc b/chrome/common/chrome_switches.cc
+index 90108a203583c..40aa27fe711f5 100644
+--- a/chrome/common/chrome_switches.cc
++++ b/chrome/common/chrome_switches.cc
+@@ -346,6 +346,10 @@ const char kForceFirstRun[] = "force-first-run";
+ // showing the First Run experience).
+ const char kForceWhatsNew[] = "force-whats-new";
+ 
++// Chronium: path to a JSON file with per-profile fingerprint configuration.
++// Loaded once at startup by chronium::FingerprintProfile::LoadFromFile().
++const char kFingerprintProfile[] = "fingerprint-profile";
++
+ // Does not show the crash restore bubble when the browser is started during the
+ // system startup phase in ChromeOS, if the ChromeOS full restore feature is
+ // enabled, because the ChromeOS full restore notification is shown for the user
+diff --git a/chrome/common/chrome_switches.h b/chrome/common/chrome_switches.h
+index 53fd53ab4a221..78b10315d7970 100644
+--- a/chrome/common/chrome_switches.h
++++ b/chrome/common/chrome_switches.h
+@@ -122,6 +122,10 @@ extern const char kForceDevToolsAvailable[];
+ extern const char kForceFirstRun[];
+ extern const char kRefreshPlatformPolicy[];
+ extern const char kForceWhatsNew[];
++
++// Chronium: path to a per-profile fingerprint JSON config file.
++extern const char kFingerprintProfile[];
++
+ extern const char kHideCrashRestoreBubble[];
+ extern const char kHomePage[];
+ #if !BUILDFLAG(IS_ANDROID)
+-- 
+2.54.0.windows.1
+

@@ -1,0 +1,54 @@
+# Chronium GN args — production code path on 32 GB RAM.
+#
+# is_official_build = true   → V8 + Blink + Chrome compiled in their
+#                              release path, so the DCHECK / CHECK /
+#                              UNREACHABLE / NOTREACHED gates that fire
+#                              renderer crashes on edge-case JS (iphey's
+#                              anti-debug probe, Pixelscan's exotic
+#                              WebGL+Audio combo) get compiled out. Up
+#                              to here this was the single biggest
+#                              difference between us and ShardX/Wayfern
+#                              binaries.
+#
+# use_thin_lto = false       → is_official_build implies ThinLTO; that
+#                              IS the OOM culprit on 32 GB, NOT the
+#                              official_build flag itself. Turning LTO
+#                              off keeps link memory in the 8-12 GB
+#                              range. Trade-off: ~20% bigger binary,
+#                              ~5% slower startup. Worth it.
+#
+# is_component_build = true  → keep the many-small-DLLs layout so each
+#                              linker invocation is tiny. With LTO off
+#                              we could in theory go monolithic, but
+#                              component_build also speeds up our
+#                              incremental edit-rebuild loop and the
+#                              binary still runs identically — just as
+#                              many DLLs on disk.
+
+is_debug = false
+is_official_build = true
+is_component_build = false      # forced: BUILD.gn:74 asserts !component when official
+use_thin_lto = false            # the actual 32GB OOM culprit
+
+# Without PGO we still get baseline production codegen. Keeping pgo
+# off entirely avoids the chrome_pgo_phase=2 path that requires a
+# pre-collected profile we don't ship.
+chrome_pgo_phase = 0
+
+# Smaller symbols (keep some for crash decoding); we don't ship a PDB.
+symbol_level = 1
+blink_symbol_level = 0
+v8_symbol_level = 0
+
+# Strip Google services.
+use_official_google_api_keys = false
+
+# Disable subsystems we don't want shipped.
+enable_widevine = false
+
+# Open codecs only (no licensing concerns; users wanting H.264/AAC
+# can flip these on at their own legal risk).
+proprietary_codecs = false
+ffmpeg_branding = "Chromium"
+
+target_cpu = "x64"

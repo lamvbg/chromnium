@@ -1,0 +1,308 @@
+From 53e0fb328470f72dca677c17e899a3317b7365a1 Mon Sep 17 00:00:00 2001
+From: Chronium Build <chronium@interlink.local>
+Date: Mon, 8 Jun 2026 08:41:24 +0700
+Subject: [PATCH 09/14] chronium: per-profile navigator.languages +
+ Element.getBoundingClientRect sub-pixel noise
+
+Two surfaces in one patch; both share the FingerprintState plumbing.
+
+navigator.languages / navigator.language
+  Reads the profile JSON's 'languages' array (or falls back to
+  accept_language string) and carries it to renderers via the new
+  kFingerprintAcceptLanguage switch. NavigatorLanguage's
+  EnsureUpdatedLanguage now checks FingerprintState first, before
+  the DevTools probe::ApplyAcceptLanguageOverride path, so the
+  override wins for both worker and document contexts.
+
+  Verified: profile B JSON 'languages: [vi-VN, vi, en-US, en]'
+  -> navigator.language === 'vi-VN',
+  navigator.languages === ['vi-VN','vi','en-US','en'].
+
+Element.getBoundingClientRect sub-pixel noise
+  Adds a seeded ~1e-5 magnitude perturbation to each of x/y/width/
+  height. KEY DESIGN POINT: the noise is applied on the DOMRect
+  (double precision) AFTER conversion from gfx::RectF, NOT on the
+  RectF itself. RectF's float32 relative epsilon (~1.2e-7) at typical
+  layout magnitudes (200-1000 px) is ~3e-5, which would swallow our
+  noise. DOMRect's double storage preserves it cleanly.
+
+  Verified: r1.x = 272.99999880 (was 273.00000000 baseline),
+  r1.width = 818.99999429, two calls return identical value
+  (deterministic per profile).
+
+  getClientRects() is left unpatched: still works on Vector<RectF>
+  where the same float32 epsilon problem applies. Every common
+  fingerprinter (creepjs, fingerprintjs, pixelscan) reads
+  getBoundingClientRect, not getClientRects.
+
+Files touched:
+- chrome/common/chrome_switches.{h,cc}
+- chrome/browser/fingerprint/fingerprint_profile.{h,cc}
+- chrome/browser/chrome_content_browser_client.cc
+- chrome/renderer/chrome_content_renderer_client.cc
+- third_party/blink/renderer/platform/fingerprint/fingerprint_state.{h,cc}
+- third_party/blink/renderer/core/frame/navigator_language.cc
+- third_party/blink/renderer/core/dom/element.cc
+---
+ .../browser/chrome_content_browser_client.cc  |  5 ++++
+ .../fingerprint/fingerprint_profile.cc        | 25 ++++++++++++++++
+ .../browser/fingerprint/fingerprint_profile.h |  3 ++
+ chrome/common/chrome_switches.cc              |  1 +
+ chrome/common/chrome_switches.h               |  4 +++
+ .../chrome_content_renderer_client.cc         |  5 ++++
+ .../blink/renderer/core/dom/element.cc        | 29 ++++++++++++++++++-
+ .../renderer/core/frame/navigator_language.cc |  9 ++++++
+ .../platform/fingerprint/fingerprint_state.cc | 23 +++++++++++++++
+ .../platform/fingerprint/fingerprint_state.h  |  5 ++++
+ 10 files changed, 108 insertions(+), 1 deletion(-)
+
+diff --git a/chrome/browser/chrome_content_browser_client.cc b/chrome/browser/chrome_content_browser_client.cc
+index 4f8cf8f59b8d2..6fb3344b4fd6e 100644
+--- a/chrome/browser/chrome_content_browser_client.cc
++++ b/chrome/browser/chrome_content_browser_client.cc
+@@ -2846,6 +2846,11 @@ void ChromeContentBrowserClient::AppendExtraCommandLineSwitches(
+         command_line->AppendSwitchASCII(switches::kFingerprintWebRtcPolicy,
+                                         webrtc);
+       }
++      const std::string accept_lang = fp->AcceptLanguageCsv();
++      if (!accept_lang.empty()) {
++        command_line->AppendSwitchASCII(switches::kFingerprintAcceptLanguage,
++                                        accept_lang);
++      }
+     }
+   }
+ #if BUILDFLAG(IS_MAC)
+diff --git a/chrome/browser/fingerprint/fingerprint_profile.cc b/chrome/browser/fingerprint/fingerprint_profile.cc
+index d9429a5297669..4468633faacbc 100644
+--- a/chrome/browser/fingerprint/fingerprint_profile.cc
++++ b/chrome/browser/fingerprint/fingerprint_profile.cc
+@@ -177,6 +177,31 @@ std::string FingerprintProfile::WebRtcPolicyValue() const {
+   return {};
+ }
+ 
++std::string FingerprintProfile::AcceptLanguageCsv() const {
++  if (!loaded_) {
++    return {};
++  }
++  // Prefer the JS-side "languages" array if present (matches what JS sees).
++  const base::ListValue* langs = dict_.FindList("languages");
++  if (langs && !langs->empty()) {
++    std::string out;
++    for (const auto& item : *langs) {
++      if (const std::string* s = item.GetIfString()) {
++        if (!out.empty()) {
++          out += ",";
++        }
++        out += *s;
++      }
++    }
++    if (!out.empty()) {
++      return out;
++    }
++  }
++  // Fall back to the HTTP-style accept_language string.
++  const std::string* al = dict_.FindString("accept_language");
++  return al ? *al : std::string();
++}
++
+ bool FingerprintProfile::LoadFromFile(const base::FilePath& path) {
+   std::string contents;
+   if (!base::ReadFileToString(path, &contents)) {
+diff --git a/chrome/browser/fingerprint/fingerprint_profile.h b/chrome/browser/fingerprint/fingerprint_profile.h
+index 80a62f4feb8ac..cb9a3b2add1a4 100644
+--- a/chrome/browser/fingerprint/fingerprint_profile.h
++++ b/chrome/browser/fingerprint/fingerprint_profile.h
+@@ -88,6 +88,9 @@ class FingerprintProfile : public chrome::mojom::FingerprintConfigProvider {
+   // "1" (proxy_only) | "2" (public_only) | "" (no override).
+   std::string WebRtcPolicyValue() const;
+ 
++  // Accept-Language header / navigator.languages comma-list. Empty = none.
++  std::string AcceptLanguageCsv() const;
++
+  private:
+   friend class base::NoDestructor<FingerprintProfile>;
+   FingerprintProfile();
+diff --git a/chrome/common/chrome_switches.cc b/chrome/common/chrome_switches.cc
+index eff84f980c9c2..7f66f096afec3 100644
+--- a/chrome/common/chrome_switches.cc
++++ b/chrome/common/chrome_switches.cc
+@@ -367,6 +367,7 @@ const char kFingerprintScreen[] = "fingerprint-screen";
+ const char kFingerprintHardware[] = "fingerprint-hardware";
+ const char kFingerprintBattery[] = "fingerprint-battery";
+ const char kFingerprintWebRtcPolicy[] = "fingerprint-webrtc-policy";
++const char kFingerprintAcceptLanguage[] = "fingerprint-accept-language";
+ 
+ // Does not show the crash restore bubble when the browser is started during the
+ // system startup phase in ChromeOS, if the ChromeOS full restore feature is
+diff --git a/chrome/common/chrome_switches.h b/chrome/common/chrome_switches.h
+index b3bfa860997d9..5792fe4f4c6e9 100644
+--- a/chrome/common/chrome_switches.h
++++ b/chrome/common/chrome_switches.h
+@@ -159,6 +159,10 @@ extern const char kFingerprintBattery[];
+ // 2=public_only.
+ extern const char kFingerprintWebRtcPolicy[];
+ 
++// Chronium (internal): Accept-Language / navigator.languages override.
++// Comma-separated list, e.g. "en-US,en".
++extern const char kFingerprintAcceptLanguage[];
++
+ extern const char kHideCrashRestoreBubble[];
+ extern const char kHomePage[];
+ #if !BUILDFLAG(IS_ANDROID)
+diff --git a/chrome/renderer/chrome_content_renderer_client.cc b/chrome/renderer/chrome_content_renderer_client.cc
+index 64f6e52e2803f..d19f6021cf158 100644
+--- a/chrome/renderer/chrome_content_renderer_client.cc
++++ b/chrome/renderer/chrome_content_renderer_client.cc
+@@ -469,6 +469,11 @@ void ChromeContentRendererClient::RenderThreadStarted() {
+       blink::FingerprintState::SetWebRtcPolicy(
+           static_cast<blink::FingerprintState::WebRtcPolicy>(wp));
+     }
++    const std::string accept_lang =
++        cmd_line->GetSwitchValueASCII(switches::kFingerprintAcceptLanguage);
++    if (!accept_lang.empty()) {
++      blink::FingerprintState::SetAcceptLanguage(accept_lang);
++    }
+   }
+ 
+   main_thread_profiler_->SetAuxUnwinderFactory(base::BindRepeating(
+diff --git a/third_party/blink/renderer/core/dom/element.cc b/third_party/blink/renderer/core/dom/element.cc
+index 2c19d148ef86a..15e864c622cda 100644
+--- a/third_party/blink/renderer/core/dom/element.cc
++++ b/third_party/blink/renderer/core/dom/element.cc
+@@ -282,6 +282,7 @@
+ #include "third_party/blink/renderer/platform/bindings/v8_dom_activity_logger.h"
+ #include "third_party/blink/renderer/platform/bindings/v8_dom_wrapper.h"
+ #include "third_party/blink/renderer/platform/bindings/v8_per_context_data.h"
++#include "third_party/blink/renderer/platform/fingerprint/fingerprint_state.h"
+ #include "third_party/blink/renderer/platform/geometry/calculation_value.h"
+ #include "third_party/blink/renderer/platform/heap/collection_support/heap_hash_set.h"
+ #include "third_party/blink/renderer/platform/heap/garbage_collected.h"
+@@ -3462,6 +3463,11 @@ DOMRectList* Element::getClientRects() {
+     GetDocument().AdjustRectForScrollAndAbsoluteZoom(rect,
+                                                      *element_layout_object);
+   }
++  // Chronium: getClientRects keeps native gfx::RectF (float32) precision,
++  // where sub-pixel noise at fingerprint-useful magnitudes would be lost
++  // to float epsilon. We only noise the JS-side getBoundingClientRect()
++  // path (DOMRect, double precision) — that's the surface every common
++  // fingerprinter (creepjs, fingerprintjs, pixelscan) actually queries.
+   return MakeGarbageCollected<DOMRectList>(rects);
+ }
+ 
+@@ -3514,7 +3520,28 @@ gfx::RectF Element::GetBoundingClientRectNoLifecycleUpdate() const {
+ DOMRect* Element::GetBoundingClientRect() {
+   GetDocument().EnsurePaintLocationDataValidForNode(
+       this, DocumentUpdateReason::kJavaScript);
+-  return DOMRect::FromRectF(GetBoundingClientRectNoLifecycleUpdate());
++  DOMRect* result =
++      DOMRect::FromRectF(GetBoundingClientRectNoLifecycleUpdate());
++  // Chronium: seeded sub-pixel noise (~1e-5 magnitude) on each component.
++  // Applied on DOMRect (double precision) AFTER conversion so the noise
++  // isn't lost to gfx::RectF's float32 epsilon (~3e-5 at typical layout
++  // magnitudes). Per-profile-stable but cross-profile-divergent; rendering
++  // and layout are unaffected because this rect is JS-only read-back.
++  if (FingerprintState::IsActive()) {
++    auto noise = [](uint32_t h) -> double {
++      return (static_cast<double>(h) * (1.0 / 2147483648.0) - 1.0) * 1e-5;
++    };
++    const uint32_t node_id = static_cast<uint32_t>(GetDomNodeId());
++    result->setX(result->x() +
++                 noise(FingerprintState::HashAt("rect", node_id, 0u)));
++    result->setY(result->y() +
++                 noise(FingerprintState::HashAt("rect", node_id, 1u)));
++    result->setWidth(result->width() +
++                     noise(FingerprintState::HashAt("rect", node_id, 2u)));
++    result->setHeight(result->height() +
++                      noise(FingerprintState::HashAt("rect", node_id, 3u)));
++  }
++  return result;
+ }
+ 
+ DOMRect* Element::GetBoundingClientRectForBinding() {
+diff --git a/third_party/blink/renderer/core/frame/navigator_language.cc b/third_party/blink/renderer/core/frame/navigator_language.cc
+index 75cd3461317b7..9902be434545c 100644
+--- a/third_party/blink/renderer/core/frame/navigator_language.cc
++++ b/third_party/blink/renderer/core/frame/navigator_language.cc
+@@ -9,6 +9,7 @@
+ #include "third_party/blink/public/common/switches.h"
+ #include "third_party/blink/renderer/core/frame/web_feature.h"
+ #include "third_party/blink/renderer/core/probe/core_probes.h"
++#include "third_party/blink/renderer/platform/fingerprint/fingerprint_state.h"
+ #include "third_party/blink/renderer/platform/language.h"
+ #include "third_party/blink/renderer/platform/wtf/text/string_builder.h"
+ 
+@@ -69,6 +70,14 @@ void NavigatorLanguage::SetLanguagesForTesting(const String& languages) {
+ }
+ 
+ void NavigatorLanguage::EnsureUpdatedLanguage() {
++  // Chronium: per-profile override has top priority over DevTools probe.
++  std::string_view chronium_langs = FingerprintState::AcceptLanguage();
++  if (!chronium_langs.empty()) {
++    languages_ = ParseAndSanitize(String(chronium_langs));
++    languages_dirty_ = true;
++    return;
++  }
++
+   String accept_languages_override;
+   probe::ApplyAcceptLanguageOverride(execution_context_,
+                                      &accept_languages_override);
+diff --git a/third_party/blink/renderer/platform/fingerprint/fingerprint_state.cc b/third_party/blink/renderer/platform/fingerprint/fingerprint_state.cc
+index 3c522cfe7274c..90edcf8e1c7f4 100644
+--- a/third_party/blink/renderer/platform/fingerprint/fingerprint_state.cc
++++ b/third_party/blink/renderer/platform/fingerprint/fingerprint_state.cc
+@@ -39,6 +39,12 @@ std::string& PlatformStorage() {
+ }
+ std::atomic<bool> g_platform_set{false};
+ 
++std::string& AcceptLanguageStorage() {
++  static base::NoDestructor<std::string> s;
++  return *s;
++}
++std::atomic<bool> g_accept_language_set{false};
++
+ FingerprintState::ScreenFp& ScreenStorage() {
+   // POD with trivial destructor — base::NoDestructor would static-assert.
+   static FingerprintState::ScreenFp s;
+@@ -156,6 +162,23 @@ std::string_view FingerprintState::Platform() {
+   return PlatformStorage();
+ }
+ 
++// static
++void FingerprintState::SetAcceptLanguage(std::string_view value) {
++  if (g_accept_language_set.load(std::memory_order_acquire) || value.empty()) {
++    return;
++  }
++  AcceptLanguageStorage().assign(value);
++  g_accept_language_set.store(true, std::memory_order_release);
++}
++
++// static
++std::string_view FingerprintState::AcceptLanguage() {
++  if (!g_accept_language_set.load(std::memory_order_acquire)) {
++    return {};
++  }
++  return AcceptLanguageStorage();
++}
++
+ // static
+ void FingerprintState::SetScreen(const ScreenFp& screen) {
+   if (g_screen_set.load(std::memory_order_acquire) || screen.width <= 0 ||
+diff --git a/third_party/blink/renderer/platform/fingerprint/fingerprint_state.h b/third_party/blink/renderer/platform/fingerprint/fingerprint_state.h
+index e42edf279c9a0..292321f8a93ed 100644
+--- a/third_party/blink/renderer/platform/fingerprint/fingerprint_state.h
++++ b/third_party/blink/renderer/platform/fingerprint/fingerprint_state.h
+@@ -45,6 +45,11 @@ class PLATFORM_EXPORT FingerprintState {
+   // First setter wins.
+   static void SetPlatform(std::string_view platform);
+ 
++  // Sets the Accept-Language header / navigator.languages override.
++  // Format: comma-separated tags ("en-US,en"). Empty = no override.
++  static void SetAcceptLanguage(std::string_view value);
++  static std::string_view AcceptLanguage();
++
+   // Empty when no override is in effect.
+   static std::string_view WebGLUnmaskedVendor();
+   static std::string_view WebGLUnmaskedRenderer();
+-- 
+2.54.0.windows.1
+

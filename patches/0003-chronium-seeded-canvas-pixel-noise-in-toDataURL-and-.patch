@@ -1,0 +1,342 @@
+From 0bfcd8df57f619d20be6e3f5668c66bf58af221f Mon Sep 17 00:00:00 2001
+From: Chronium Build <chronium@interlink.local>
+Date: Fri, 5 Jun 2026 16:11:48 +0700
+Subject: [PATCH 03/14] chronium: seeded canvas pixel noise in toDataURL and
+ toBlob
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds the first real anti-detect surface patch: HTMLCanvasElement
+readback now produces per-profile-deterministic but cross-profile-
+divergent pixel data, defeating canvas fingerprinting that hashes
+toDataURL/toBlob output.
+
+New: blink::FingerprintState (third_party/blink/renderer/platform/
+fingerprint/) — a renderer-process-wide holder for the seed received
+from the browser via Mojo (patch 0002). First setter wins, all-zero
+seeds are rejected. Exposes HashAt(channel, x, y) — a deterministic
+32-bit hash mixing the seed with a per-surface channel name plus
+coordinates. Same (profile, channel, x, y) -> same hash forever.
+
+Hook: chrome/renderer/chrome_render_frame_observer.cc's Mojo
+GetConfig callback now calls FingerprintState::Set instead of just
+logging.
+
+Patch: HTMLCanvasElement::ToDataURLInternal and toBlob now run the
+Snapshot through ApplyCanvasFingerprintNoise (file-local helper).
+For each pixel, HashAt('canvas', x, y) selects ~1 in 256 pixels and
+flips the LSB of one of R/G/B (alpha untouched). Visually
+imperceptible, cryptographically detectable: tested with two
+fingerprint profiles, toDataURL hash differs and PNG length differs.
+
+Known limitation: race between DidCreateNewDocument firing the
+GetConfig Mojo call and the document's inline scripts. A canvas
+fingerprint read SYNCHRONOUSLY from a top-level <script> on first
+load may run before the Mojo response arrives, in which case
+IsActive() is false and ApplyCanvasFingerprintNoise returns the
+input unchanged. The next read (after any await/setTimeout) sees
+the seed and is noised. To fix in a follow-up patch by passing the
+seed to renderer processes via a command-line switch instead of
+async Mojo.
+
+Files touched:
+- third_party/blink/renderer/platform/fingerprint/
+    fingerprint_state.{h,cc}                  (new)
+- third_party/blink/renderer/platform/BUILD.gn  (register sources)
+- chrome/renderer/chrome_render_frame_observer.cc
+                                                (push seed to blink)
+- third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
+                                                (apply noise pre-encode)
+
+Verified: profile A hash -718601788 (len 1562), profile B hash
+1834648629 (len 1838). Same profile across 3 reads -> same hash.
+---
+ .../renderer/chrome_render_frame_observer.cc  | 11 +--
+ .../core/html/canvas/html_canvas_element.cc   | 53 ++++++++++++
+ third_party/blink/renderer/platform/BUILD.gn  |  2 +
+ .../platform/fingerprint/fingerprint_state.cc | 85 +++++++++++++++++++
+ .../platform/fingerprint/fingerprint_state.h  | 49 +++++++++++
+ 5 files changed, 193 insertions(+), 7 deletions(-)
+ create mode 100644 third_party/blink/renderer/platform/fingerprint/fingerprint_state.cc
+ create mode 100644 third_party/blink/renderer/platform/fingerprint/fingerprint_state.h
+
+diff --git a/chrome/renderer/chrome_render_frame_observer.cc b/chrome/renderer/chrome_render_frame_observer.cc
+index 6522a4d35e6e7..35802b72ddcd0 100644
+--- a/chrome/renderer/chrome_render_frame_observer.cc
++++ b/chrome/renderer/chrome_render_frame_observer.cc
+@@ -28,6 +28,7 @@
+ #include "chrome/common/chrome_switches.h"
+ #include "chrome/common/fingerprint.mojom.h"
+ #include "chrome/common/open_search_description_document_handler.mojom.h"
++#include "third_party/blink/renderer/platform/fingerprint/fingerprint_state.h"
+ #include "chrome/common/webui_url_constants.h"
+ #include "chrome/renderer/actor/journal.h"
+ #include "chrome/renderer/actor/page_stability_monitor.h"
+@@ -297,13 +298,9 @@ void ChromeRenderFrameObserver::DidCreateNewDocument() {
+         [](mojo::Remote<chrome::mojom::FingerprintConfigProvider>,
+            chrome::mojom::FingerprintConfigPtr config) {
+           if (config && config->seed.size() == 32) {
+-            LOG(INFO) << "[chronium-renderer] fp config received, seed[0..3]="
+-                      << static_cast<int>(config->seed[0]) << ","
+-                      << static_cast<int>(config->seed[1]) << ","
+-                      << static_cast<int>(config->seed[2]) << ","
+-                      << static_cast<int>(config->seed[3]);
+-          } else {
+-            LOG(INFO) << "[chronium-renderer] fp config received (empty)";
++            blink::FingerprintState::Set(config->seed.data());
++            LOG(INFO) << "[chronium-renderer] fp config received, active="
++                      << blink::FingerprintState::IsActive();
+           }
+         },
+         std::move(fp_provider)));
+diff --git a/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc b/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
+index 6a7419e4a1f1a..0b8e1604bfa05 100644
+--- a/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
++++ b/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
+@@ -120,9 +120,13 @@
+ #include "third_party/blink/renderer/platform/graphics/memory_managed_paint_recorder.h"
+ #include "third_party/blink/renderer/platform/graphics/paint/paint_canvas.h"
+ #include "third_party/blink/renderer/platform/graphics/skia/skia_utils.h"
++#include "third_party/blink/renderer/platform/fingerprint/fingerprint_state.h"
+ #include "third_party/blink/renderer/platform/graphics/static_bitmap_image.h"
+ #include "third_party/blink/renderer/platform/graphics/static_bitmap_image_to_video_frame_copier.h"
+ #include "third_party/blink/renderer/platform/graphics/static_bitmap_image_transform.h"
++#include "third_party/skia/include/core/SkData.h"
++#include "third_party/skia/include/core/SkImage.h"
++#include "third_party/skia/include/core/SkImageInfo.h"
+ #include "third_party/blink/renderer/platform/graphics/web_graphics_context_3d_video_frame_pool.h"
+ #include "third_party/blink/renderer/platform/heap/thread_state.h"
+ #include "third_party/blink/renderer/platform/image-encoders/image_encoder_utils.h"
+@@ -139,6 +143,51 @@ namespace blink {
+ 
+ namespace {
+ 
++// Chronium: applies seeded sub-pixel noise to a canvas snapshot. Returns a
++// new StaticBitmapImage where ~0.4% of pixels have one RGB channel's LSB
++// flipped (deterministic for the same fingerprint profile, different
++// across profiles). Returns |input| unchanged when FingerprintState is
++// inactive or the bitmap cannot be read.
++scoped_refptr<StaticBitmapImage> ApplyCanvasFingerprintNoise(
++    scoped_refptr<StaticBitmapImage> input) {
++  if (!input || !FingerprintState::IsActive()) {
++    return input;
++  }
++  PaintImage paint_image = input->PaintImageForCurrentFrame();
++  sk_sp<SkImage> sk_image = paint_image.GetSwSkImage();
++  if (!sk_image) {
++    return input;
++  }
++  SkImageInfo info = sk_image->imageInfo().makeColorType(kRGBA_8888_SkColorType);
++  const size_t row_bytes = info.minRowBytes();
++  const size_t total_bytes = row_bytes * static_cast<size_t>(info.height());
++  if (total_bytes == 0) {
++    return input;
++  }
++  sk_sp<SkData> data = SkData::MakeUninitialized(total_bytes);
++  if (!data || !sk_image->readPixels(info, data->writable_data(), row_bytes,
++                                     /*srcX=*/0, /*srcY=*/0)) {
++    return input;
++  }
++  uint8_t* pixels = static_cast<uint8_t*>(data->writable_data());
++  const uint32_t w = static_cast<uint32_t>(info.width());
++  const uint32_t h = static_cast<uint32_t>(info.height());
++  for (uint32_t y = 0; y < h; ++y) {
++    uint8_t* row = pixels + y * row_bytes;
++    for (uint32_t x = 0; x < w; ++x) {
++      const uint32_t hash = FingerprintState::HashAt("canvas", x, y);
++      // Threshold = 1/256 ≈ 0.39% pixels modified. Visually imperceptible
++      // (LSB flip of one channel on a tiny minority of pixels), but the
++      // canvas hash differs per profile.
++      if ((hash & 0xFFu) == 0u) {
++        const uint32_t which = (hash >> 8) % 3u;  // R, G, or B (skip alpha)
++        row[x * 4u + which] ^= 1u;
++      }
++    }
++  }
++  return StaticBitmapImage::Create(std::move(data), info);
++}
++
+ constexpr unsigned kMaxCanvasAnimationBacklog = 2;
+ 
+ // These two constants determine if a newly created canvas starts with
+@@ -1307,6 +1356,8 @@ String HTMLCanvasElement::ToDataURLInternal(
+           mime_type, ImageEncoderUtils::kEncodeReasonToDataURL);
+ 
+   scoped_refptr<StaticBitmapImage> image_bitmap = Snapshot(source_buffer);
++  // Chronium: per-profile pixel noise before encoding.
++  image_bitmap = ApplyCanvasFingerprintNoise(std::move(image_bitmap));
+   if (image_bitmap) {
+     std::unique_ptr<ImageDataBuffer> data_buffer =
+         ImageDataBuffer::Create(image_bitmap);
+@@ -1418,6 +1469,8 @@ void HTMLCanvasElement::toBlob(V8BlobCallback* callback,
+ 
+   CanvasAsyncBlobCreator* async_creator = nullptr;
+   scoped_refptr<StaticBitmapImage> image_bitmap = Snapshot(kBackBuffer);
++  // Chronium: per-profile pixel noise before encoding.
++  image_bitmap = ApplyCanvasFingerprintNoise(std::move(image_bitmap));
+   if (image_bitmap) {
+     auto* options = ImageEncodeOptions::Create();
+     options->setType(ImageEncoderUtils::MimeTypeName(encoding_mime_type));
+diff --git a/third_party/blink/renderer/platform/BUILD.gn b/third_party/blink/renderer/platform/BUILD.gn
+index 87f64f5c2cfd4..93da29e85f02c 100644
+--- a/third_party/blink/renderer/platform/BUILD.gn
++++ b/third_party/blink/renderer/platform/BUILD.gn
+@@ -630,6 +630,8 @@ component("platform") {
+     "feature_context.h",
+     "file_metadata.cc",
+     "file_metadata.h",
++    "fingerprint/fingerprint_state.cc",
++    "fingerprint/fingerprint_state.h",
+     "fonts/alternate_font_family.h",
+     "fonts/bitmap_glyphs_block_list.cc",
+     "fonts/bitmap_glyphs_block_list.h",
+diff --git a/third_party/blink/renderer/platform/fingerprint/fingerprint_state.cc b/third_party/blink/renderer/platform/fingerprint/fingerprint_state.cc
+new file mode 100644
+index 0000000000000..0bb61f9339b23
+--- /dev/null
++++ b/third_party/blink/renderer/platform/fingerprint/fingerprint_state.cc
+@@ -0,0 +1,85 @@
++// Copyright 2026 The Chronium Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license.
++
++#include "third_party/blink/renderer/platform/fingerprint/fingerprint_state.h"
++
++#include <atomic>
++#include <cstring>
++
++namespace blink {
++
++namespace {
++
++// Process-wide state. The seed is set once early in the process by
++// chrome/renderer's Mojo response handler and read by every fingerprint
++// surface patch thereafter. We use std::atomic on a flag + raw bytes
++// behind it; the bytes are written exactly once before |g_active| flips
++// to true, so concurrent readers see a fully-initialized seed.
++std::array<uint8_t, 32> g_seed{};
++std::atomic<bool> g_active{false};
++
++// xxHash-style scalar mix. Cryptographically weak but plenty good for
++// distinguishing fingerprints. Deterministic for the same (seed, channel,
++// x, y) tuple.
++uint32_t Mix32(uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
++  uint32_t h = a;
++  h ^= b * 0x9E3779B1u;
++  h ^= c * 0x85EBCA77u;
++  h ^= d * 0xC2B2AE3Du;
++  h = (h ^ (h >> 16)) * 0x7FEB352Du;
++  h = (h ^ (h >> 15)) * 0x846CA68Bu;
++  return h ^ (h >> 16);
++}
++
++// Folds a string into a 32-bit value. Tiny FNV-1a is enough — we only
++// use a handful of channel names ("canvas", "webgl-readpixels", ...).
++uint32_t FoldChannel(std::string_view s) {
++  uint32_t h = 0x811C9DC5u;
++  for (char c : s) {
++    h = (h ^ static_cast<uint8_t>(c)) * 0x01000193u;
++  }
++  return h;
++}
++
++}  // namespace
++
++// static
++void FingerprintState::Set(const uint8_t* seed_32) {
++  if (g_active.load(std::memory_order_acquire)) {
++    return;  // First setter wins.
++  }
++  // Check whether the seed is all-zeros, which means "no profile" on the
++  // browser side. Stay inactive in that case so patches keep default
++  // behavior.
++  bool any_nonzero = false;
++  for (size_t i = 0; i < 32; ++i) {
++    if (seed_32[i] != 0) {
++      any_nonzero = true;
++      break;
++    }
++  }
++  if (!any_nonzero) {
++    return;
++  }
++  std::memcpy(g_seed.data(), seed_32, 32);
++  g_active.store(true, std::memory_order_release);
++}
++
++// static
++bool FingerprintState::IsActive() {
++  return g_active.load(std::memory_order_acquire);
++}
++
++// static
++uint32_t FingerprintState::HashAt(std::string_view channel,
++                                  uint32_t x,
++                                  uint32_t y) {
++  // Pack 16 bytes of seed into 4 uint32s for mixing. Using only half of
++  // the 32-byte seed is fine — that's still 128 bits of entropy.
++  uint32_t s0, s1;
++  std::memcpy(&s0, g_seed.data() + 0, 4);
++  std::memcpy(&s1, g_seed.data() + 8, 4);
++  return Mix32(s0 ^ s1, FoldChannel(channel), x, y);
++}
++
++}  // namespace blink
+diff --git a/third_party/blink/renderer/platform/fingerprint/fingerprint_state.h b/third_party/blink/renderer/platform/fingerprint/fingerprint_state.h
+new file mode 100644
+index 0000000000000..1f020bcc83441
+--- /dev/null
++++ b/third_party/blink/renderer/platform/fingerprint/fingerprint_state.h
+@@ -0,0 +1,49 @@
++// Copyright 2026 The Chronium Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license.
++
++// Renderer-process-wide holder for the fingerprint seed delivered by the
++// browser via Mojo (see patch 0002). All fingerprint surface patches
++// (canvas, WebGL, audio, ...) read from this singleton via IsActive() +
++// NoiseAtPixel() / PrngFor().
++//
++// Same renderer process = same Chronium browser instance = same
++// fingerprint profile, so a process-wide single value is correct. Set
++// is idempotent: if called twice with the same seed, second call is
++// a no-op; with a different seed, second call is ignored (the first
++// frame wins).
++
++#ifndef THIRD_PARTY_BLINK_RENDERER_PLATFORM_FINGERPRINT_FINGERPRINT_STATE_H_
++#define THIRD_PARTY_BLINK_RENDERER_PLATFORM_FINGERPRINT_FINGERPRINT_STATE_H_
++
++#include <array>
++#include <cstdint>
++#include <string_view>
++
++#include "third_party/blink/renderer/platform/platform_export.h"
++
++namespace blink {
++
++class PLATFORM_EXPORT FingerprintState {
++ public:
++  // Sets the 32-byte seed for this renderer process. Safe to call
++  // multiple times; only the first successful call has effect. The
++  // |seed| must point to 32 bytes.
++  static void Set(const uint8_t* seed_32);
++
++  // True when a non-zero seed has been Set(). Fingerprint patches MUST
++  // check this and fall back to default behavior when false.
++  static bool IsActive();
++
++  // Deterministic 32-bit hash of (process seed, channel, x, y).
++  // |channel| should be a short stable string identifying the fingerprint
++  // surface, e.g. "canvas", "webgl-readpixels", "audio".
++  // Same (seed, channel, x, y) -> same output, every call, forever.
++  static uint32_t HashAt(std::string_view channel, uint32_t x, uint32_t y);
++
++ private:
++  FingerprintState() = delete;
++};
++
++}  // namespace blink
++
++#endif  // THIRD_PARTY_BLINK_RENDERER_PLATFORM_FINGERPRINT_FINGERPRINT_STATE_H_
+-- 
+2.54.0.windows.1
+

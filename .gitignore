@@ -1,0 +1,11 @@
+# Build output (huge)
+release/
+
+# rcedit and similar third-party tools — fetched per-machine
+tools/*.exe
+
+# OS junk
+Thumbs.db
+desktop.ini
+*.swp
+*.tmp

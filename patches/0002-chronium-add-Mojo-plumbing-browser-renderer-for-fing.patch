@@ -1,0 +1,255 @@
+From 028b45bcb8cddbf23b95ccbf2de6f184d9387ae7 Mon Sep 17 00:00:00 2001
+From: Chronium Build <chronium@interlink.local>
+Date: Fri, 5 Jun 2026 15:34:49 +0700
+Subject: [PATCH 02/14] chronium: add Mojo plumbing browser->renderer for
+ fingerprint config
+
+Adds the Mojo channel that lets each renderer fetch the fingerprint
+config that the browser singleton (patch 0001) loaded from JSON.
+
+New mojom: chrome::mojom::FingerprintConfigProvider with one method
+GetConfig() returning chrome::mojom::FingerprintConfig (seed only
+for now; later patches will extend the struct as they need fields).
+
+Browser side: FingerprintProfile now implements
+FingerprintConfigProvider directly and exposes a static Bind() that
+PopulateChromeFrameBinders registers per RenderFrameHost. Receivers
+are kept in a ReceiverSet on the singleton.
+
+Renderer side: ChromeRenderFrameObserver::DidCreateNewDocument
+issues GetConfig() through the BrowserInterfaceBroker for the main
+frame. The Remote is moved into the response callback so it stays
+alive until the browser replies.
+
+For verification only: the callback logs seed[0..3] to stderr so a
+smoke test can confirm the channel works end to end. Later patches
+(canvas, WebGL, navigator, ...) will instead store the config in a
+per-frame holder and read from it during fingerprint surface calls.
+
+Files touched:
+- chrome/common/fingerprint.mojom                          (new)
+- chrome/common/BUILD.gn                                   (register mojom)
+- chrome/browser/fingerprint/fingerprint_profile.{h,cc}    (impl provider)
+- chrome/browser/chrome_browser_interface_binders.cc       (register binder)
+- chrome/renderer/chrome_render_frame_observer.cc          (fetch + log)
+
+Verified: 'chronium --fingerprint-profile=...' boots, browser logs
+'Loaded fingerprint profile from ...' and renderer logs
+'fp config received, seed[0..3]=15,58,139,108' matching the JSON seed.
+---
+ .../chrome_browser_interface_binders.cc       |  5 ++++
+ .../fingerprint/fingerprint_profile.cc        | 14 ++++++++++
+ .../browser/fingerprint/fingerprint_profile.h | 25 ++++++++++++++++--
+ chrome/common/BUILD.gn                        |  1 +
+ chrome/common/fingerprint.mojom               | 24 +++++++++++++++++
+ .../renderer/chrome_render_frame_observer.cc  | 26 +++++++++++++++++++
+ 6 files changed, 93 insertions(+), 2 deletions(-)
+ create mode 100644 chrome/common/fingerprint.mojom
+
+diff --git a/chrome/browser/chrome_browser_interface_binders.cc b/chrome/browser/chrome_browser_interface_binders.cc
+index 7e78d75860689..28f40b64fd141 100644
+--- a/chrome/browser/chrome_browser_interface_binders.cc
++++ b/chrome/browser/chrome_browser_interface_binders.cc
+@@ -15,6 +15,7 @@
+ #include "chrome/browser/actor/actor_script_tool_receiver.h"
+ #include "chrome/browser/buildflags.h"
+ #include "chrome/browser/dom_distiller/dom_distiller_service_factory.h"
++#include "chrome/browser/fingerprint/fingerprint_profile.h"
+ #include "chrome/browser/navigation_predictor/navigation_predictor.h"
+ #include "chrome/browser/optimization_guide/optimization_guide_keyed_service.h"
+ #include "chrome/browser/optimization_guide/optimization_guide_keyed_service_factory.h"
+@@ -478,6 +479,10 @@ void PopulateChromeFrameBinders(
+       base::BindRepeating(
+           &SearchEngineTabHelper::BindOpenSearchDescriptionDocumentHandler));
+ 
++  // Chronium: renderer-to-browser channel for per-frame fingerprint config.
++  map->Add<chrome::mojom::FingerprintConfigProvider>(
++      base::BindRepeating(&chronium::FingerprintProfile::Bind));
++
+ #if BUILDFLAG(IS_ANDROID)
+   map->Add<blink::mojom::InstalledAppProvider>(
+       &ForwardToJavaFrame<blink::mojom::InstalledAppProvider>);
+diff --git a/chrome/browser/fingerprint/fingerprint_profile.cc b/chrome/browser/fingerprint/fingerprint_profile.cc
+index 9242345e0d717..56a64ade2b5eb 100644
+--- a/chrome/browser/fingerprint/fingerprint_profile.cc
++++ b/chrome/browser/fingerprint/fingerprint_profile.cc
+@@ -7,6 +7,7 @@
+ #include <string>
+ #include <string_view>
+ #include <utility>
++#include <vector>
+ 
+ #include "base/files/file_util.h"
+ #include "base/json/json_reader.h"
+@@ -47,9 +48,22 @@ FingerprintProfile* FingerprintProfile::GetInstance() {
+   return instance.get();
+ }
+ 
++// static
++void FingerprintProfile::Bind(
++    content::RenderFrameHost* /*render_frame_host*/,
++    mojo::PendingReceiver<chrome::mojom::FingerprintConfigProvider> receiver) {
++  GetInstance()->receivers_.Add(GetInstance(), std::move(receiver));
++}
++
+ FingerprintProfile::FingerprintProfile() = default;
+ FingerprintProfile::~FingerprintProfile() = default;
+ 
++void FingerprintProfile::GetConfig(GetConfigCallback callback) {
++  auto config = chrome::mojom::FingerprintConfig::New();
++  config->seed = std::vector<uint8_t>(seed_.begin(), seed_.end());
++  std::move(callback).Run(std::move(config));
++}
++
+ bool FingerprintProfile::LoadFromFile(const base::FilePath& path) {
+   std::string contents;
+   if (!base::ReadFileToString(path, &contents)) {
+diff --git a/chrome/browser/fingerprint/fingerprint_profile.h b/chrome/browser/fingerprint/fingerprint_profile.h
+index b7b252483f4a6..3ff3f5e1cd2fe 100644
+--- a/chrome/browser/fingerprint/fingerprint_profile.h
++++ b/chrome/browser/fingerprint/fingerprint_profile.h
+@@ -17,13 +17,27 @@
+ #include "base/files/file_path.h"
+ #include "base/no_destructor.h"
+ #include "base/values.h"
++#include "chrome/common/fingerprint.mojom.h"
++#include "mojo/public/cpp/bindings/pending_receiver.h"
++#include "mojo/public/cpp/bindings/receiver_set.h"
++
++namespace content {
++class RenderFrameHost;
++}
+ 
+ namespace chronium {
+ 
+-class FingerprintProfile {
++class FingerprintProfile : public chrome::mojom::FingerprintConfigProvider {
+  public:
+   static FingerprintProfile* GetInstance();
+ 
++  // Binder registered with PopulateChromeFrameBinders for the per-frame
++  // FingerprintConfigProvider interface. The renderer reaches the browser
++  // through this. Routes the receiver to the singleton.
++  static void Bind(
++      content::RenderFrameHost* render_frame_host,
++      mojo::PendingReceiver<chrome::mojom::FingerprintConfigProvider> receiver);
++
+   FingerprintProfile(const FingerprintProfile&) = delete;
+   FingerprintProfile& operator=(const FingerprintProfile&) = delete;
+ 
+@@ -33,6 +47,9 @@ class FingerprintProfile {
+   // returns false; renderer patches MUST fall back to default behavior.
+   bool LoadFromFile(const base::FilePath& path);
+ 
++  // chrome::mojom::FingerprintConfigProvider:
++  void GetConfig(GetConfigCallback callback) override;
++
+   // True once a JSON file has been successfully loaded.
+   bool IsLoaded() const { return loaded_; }
+ 
+@@ -49,11 +66,15 @@ class FingerprintProfile {
+  private:
+   friend class base::NoDestructor<FingerprintProfile>;
+   FingerprintProfile();
+-  ~FingerprintProfile();
++  ~FingerprintProfile() override;
+ 
+   bool loaded_ = false;
+   base::DictValue dict_;
+   std::array<uint8_t, 32> seed_{};
++
++  // Holds every active renderer-side Remote so callbacks can resolve
++  // even after a navigation rebinds the interface.
++  mojo::ReceiverSet<chrome::mojom::FingerprintConfigProvider> receivers_;
+ };
+ 
+ }  // namespace chronium
+diff --git a/chrome/common/BUILD.gn b/chrome/common/BUILD.gn
+index 1a692fe440945..30e9c6d865b9d 100644
+--- a/chrome/common/BUILD.gn
++++ b/chrome/common/BUILD.gn
+@@ -669,6 +669,7 @@ mojom("mojo_bindings") {
+   sources = [
+     "actor.mojom",
+     "chrome_render_frame.mojom",
++    "fingerprint.mojom",
+     "google_accounts_private_api_extension.mojom",
+     "media/webrtc_logging.mojom",
+     "net/net_error_page_support.mojom",
+diff --git a/chrome/common/fingerprint.mojom b/chrome/common/fingerprint.mojom
+new file mode 100644
+index 0000000000000..c21475ebd6434
+--- /dev/null
++++ b/chrome/common/fingerprint.mojom
+@@ -0,0 +1,24 @@
++// Copyright 2026 The Chronium Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license.
++
++// Chronium: per-frame fingerprint configuration delivered from the browser
++// process (which loaded the JSON at startup, see patch 0001) to each
++// renderer frame. All anti-detect Blink patches will read from a per-frame
++// store populated via this interface.
++
++module chrome.mojom;
++
++struct FingerprintConfig {
++  // 32-byte seed for deterministic noise generators. All-zero when no
++  // fingerprint profile is active on the browser side.
++  array<uint8> seed;
++};
++
++// Renderer-to-browser interface. The browser exposes one instance per
++// RenderFrameHost; the renderer obtains it through the
++// BrowserInterfaceBroker associated with the RenderFrame.
++interface FingerprintConfigProvider {
++  // Returns the active fingerprint config for this frame, or an empty
++  // config (all-zero seed) when no profile is loaded.
++  GetConfig() => (FingerprintConfig config);
++};
+diff --git a/chrome/renderer/chrome_render_frame_observer.cc b/chrome/renderer/chrome_render_frame_observer.cc
+index 1bad57107582a..6522a4d35e6e7 100644
+--- a/chrome/renderer/chrome_render_frame_observer.cc
++++ b/chrome/renderer/chrome_render_frame_observer.cc
+@@ -26,6 +26,7 @@
+ #include "chrome/common/chrome_constants.h"
+ #include "chrome/common/chrome_isolated_world_ids.h"
+ #include "chrome/common/chrome_switches.h"
++#include "chrome/common/fingerprint.mojom.h"
+ #include "chrome/common/open_search_description_document_handler.mojom.h"
+ #include "chrome/common/webui_url_constants.h"
+ #include "chrome/renderer/actor/journal.h"
+@@ -283,6 +284,31 @@ void ChromeRenderFrameObserver::DidFinishLoad() {
+ }
+ 
+ void ChromeRenderFrameObserver::DidCreateNewDocument() {
++  // Chronium: fetch per-frame fingerprint config from the browser. Later
++  // fingerprint patches (canvas noise, WebGL spoof, ...) will read from the
++  // per-frame store this populates. For now we just log seed[0] to prove
++  // the wire-up: browser singleton -> Mojo -> renderer.
++  if (render_frame() && render_frame()->IsMainFrame()) {
++    mojo::Remote<chrome::mojom::FingerprintConfigProvider> fp_provider;
++    render_frame()->GetBrowserInterfaceBroker().GetInterface(
++        fp_provider.BindNewPipeAndPassReceiver());
++    auto* raw = fp_provider.get();
++    raw->GetConfig(base::BindOnce(
++        [](mojo::Remote<chrome::mojom::FingerprintConfigProvider>,
++           chrome::mojom::FingerprintConfigPtr config) {
++          if (config && config->seed.size() == 32) {
++            LOG(INFO) << "[chronium-renderer] fp config received, seed[0..3]="
++                      << static_cast<int>(config->seed[0]) << ","
++                      << static_cast<int>(config->seed[1]) << ","
++                      << static_cast<int>(config->seed[2]) << ","
++                      << static_cast<int>(config->seed[3]);
++          } else {
++            LOG(INFO) << "[chronium-renderer] fp config received (empty)";
++          }
++        },
++        std::move(fp_provider)));
++  }
++
+ #if BUILDFLAG(ENABLE_OFFLINE_PAGES)
+   DCHECK(render_frame());
+   if (!render_frame()->IsMainFrame())
+-- 
+2.54.0.windows.1
+

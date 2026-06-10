@@ -1,0 +1,351 @@
+From 3565b726bb2e098d6bf87f297873f66a91b210d3 Mon Sep 17 00:00:00 2001
+From: Chronium Build <chronium@interlink.local>
+Date: Mon, 8 Jun 2026 13:10:30 +0700
+Subject: [PATCH 14/14] chronium: permissions.query DENIED -> ASK + per-profile
+ font enumeration allowlist
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Two anti-detect surfaces in one patch.
+
+Permissions.query (plan §5 #16)
+  When a fingerprint profile is active and the platform returns
+  DENIED for one of the cross-checked permissions (notifications,
+  geolocation, audio/video capture, midi), the patch remaps the
+  status to ASK before the JS promise resolves.
+
+  Why: real Chrome on a fresh profile yields Notification.permission
+  === 'default' AND permissions.query({name:'notifications'})
+  resolving to 'prompt' (the JS spelling of ASK). Headless Chrome
+  / bot stacks default these queries to 'denied' while leaving
+  Notification.permission at 'default', which is the well-known
+  inconsistency every modern fingerprinter (creepjs, fpjs2,
+  pixelscan) flags as a hard automation signal.
+
+  Verified: profile B query returns state 'prompt', and
+  Notification.permission is 'default' — the pair the spec says a
+  fresh user sees.
+
+Font enumeration allowlist (plan §5 #9)
+  FingerprintState gains SetFontsAllowlist / IsFontAllowed.
+  FingerprintProfile parses the JSON 'fonts' array to a CSV string;
+  the browser propagates as --fingerprint-fonts; the renderer
+  installs into FingerprintState at RenderThreadStarted. FontCache::
+  GetFontPlatformData returns nullptr early for any kCreateFontByFamily
+  request whose family isn't in the allowlist, which makes
+  ctx.measureText fall through the fallback chain to Arial.
+
+  Match is case-insensitive ASCII. Empty allowlist = no restriction
+  (so vanilla Chronium without a profile, or a profile with no
+  'fonts' key, is unaffected).
+
+  Verified on profile A (allowlist contains Arial, Calibri,
+  Cambria, ...):
+    measureText('Arial')        -> 109.376  (baseline)
+    measureText('Calibri', ...) -> 101.701  (allowlisted, renders)
+    measureText('FooBarFont')   -> 109.376  (denied -> Arial fallback)
+    measureText('SomeRareFont') -> 109.376  (denied -> Arial fallback)
+
+  Web fonts loaded via @font-face / <link rel=stylesheet> are
+  unaffected: those go through CSSFontFaceSource / RemoteFontFaceSource
+  rather than GetFontPlatformData-by-family-name, so pages that
+  pull in their own webfonts still render correctly. Only LOCAL
+  fonts referenced by family name are filtered, which is precisely
+  what local-font fingerprinters key on.
+
+Files touched:
+- chrome/common/chrome_switches.{h,cc}
+- chrome/browser/fingerprint/fingerprint_profile.{h,cc}
+- chrome/browser/chrome_content_browser_client.cc
+- chrome/renderer/chrome_content_renderer_client.cc
+- third_party/blink/renderer/platform/fingerprint/fingerprint_state.{h,cc}
+- third_party/blink/renderer/modules/permissions/permissions.cc
+- third_party/blink/renderer/platform/fonts/font_cache.cc
+---
+ .../browser/chrome_content_browser_client.cc  |  4 ++
+ .../fingerprint/fingerprint_profile.cc        | 18 ++++++
+ .../browser/fingerprint/fingerprint_profile.h |  4 ++
+ chrome/common/chrome_switches.cc              |  1 +
+ chrome/common/chrome_switches.h               |  4 ++
+ .../chrome_content_renderer_client.cc         |  5 ++
+ .../modules/permissions/permissions.cc        | 24 ++++++++
+ .../platform/fingerprint/fingerprint_state.cc | 59 +++++++++++++++++++
+ .../platform/fingerprint/fingerprint_state.h  |  8 +++
+ .../renderer/platform/fonts/font_cache.cc     | 13 ++++
+ 10 files changed, 140 insertions(+)
+
+diff --git a/chrome/browser/chrome_content_browser_client.cc b/chrome/browser/chrome_content_browser_client.cc
+index eb79edfb0dbcc..c261099fb25ab 100644
+--- a/chrome/browser/chrome_content_browser_client.cc
++++ b/chrome/browser/chrome_content_browser_client.cc
+@@ -2855,6 +2855,10 @@ void ChromeContentBrowserClient::AppendExtraCommandLineSwitches(
+       if (!tz.empty()) {
+         command_line->AppendSwitchASCII(switches::kFingerprintTimezone, tz);
+       }
++      const std::string fonts = fp->FontsCsv();
++      if (!fonts.empty()) {
++        command_line->AppendSwitchASCII(switches::kFingerprintFonts, fonts);
++      }
+     }
+   }
+ #if BUILDFLAG(IS_MAC)
+diff --git a/chrome/browser/fingerprint/fingerprint_profile.cc b/chrome/browser/fingerprint/fingerprint_profile.cc
+index 2c8a6cabe14b7..77716f202dc71 100644
+--- a/chrome/browser/fingerprint/fingerprint_profile.cc
++++ b/chrome/browser/fingerprint/fingerprint_profile.cc
+@@ -236,6 +236,24 @@ FingerprintProfile::UserAgentMetadata() const {
+   return m;
+ }
+ 
++std::string FingerprintProfile::FontsCsv() const {
++  if (!loaded_) {
++    return {};
++  }
++  const base::ListValue* list = dict_.FindList("fonts");
++  if (!list || list->empty()) {
++    return {};
++  }
++  std::string out;
++  for (const auto& item : *list) {
++    if (const std::string* s = item.GetIfString()) {
++      if (!out.empty()) out += ",";
++      out += *s;
++    }
++  }
++  return out;
++}
++
+ std::string FingerprintProfile::AcceptLanguageCsv() const {
+   if (!loaded_) {
+     return {};
+diff --git a/chrome/browser/fingerprint/fingerprint_profile.h b/chrome/browser/fingerprint/fingerprint_profile.h
+index fb1d7777fe52a..57cdf6fe84749 100644
+--- a/chrome/browser/fingerprint/fingerprint_profile.h
++++ b/chrome/browser/fingerprint/fingerprint_profile.h
+@@ -103,6 +103,10 @@ class FingerprintProfile : public chrome::mojom::FingerprintConfigProvider {
+   // which signals callers to fall back to Chromium's default metadata.
+   std::optional<blink::UserAgentMetadata> UserAgentMetadata() const;
+ 
++  // Comma-separated allowlist of font family names from JSON 'fonts' array.
++  // Empty = no restriction.
++  std::string FontsCsv() const;
++
+  private:
+   friend class base::NoDestructor<FingerprintProfile>;
+   FingerprintProfile();
+diff --git a/chrome/common/chrome_switches.cc b/chrome/common/chrome_switches.cc
+index 17765b5649c38..109dd509dcdd5 100644
+--- a/chrome/common/chrome_switches.cc
++++ b/chrome/common/chrome_switches.cc
+@@ -369,6 +369,7 @@ const char kFingerprintBattery[] = "fingerprint-battery";
+ const char kFingerprintWebRtcPolicy[] = "fingerprint-webrtc-policy";
+ const char kFingerprintAcceptLanguage[] = "fingerprint-accept-language";
+ const char kFingerprintTimezone[] = "fingerprint-timezone";
++const char kFingerprintFonts[] = "fingerprint-fonts";
+ 
+ // Does not show the crash restore bubble when the browser is started during the
+ // system startup phase in ChromeOS, if the ChromeOS full restore feature is
+diff --git a/chrome/common/chrome_switches.h b/chrome/common/chrome_switches.h
+index 91ce43aac5e7a..867970c551333 100644
+--- a/chrome/common/chrome_switches.h
++++ b/chrome/common/chrome_switches.h
+@@ -166,6 +166,10 @@ extern const char kFingerprintAcceptLanguage[];
+ // Chronium (internal): IANA timezone override, e.g. "America/New_York".
+ extern const char kFingerprintTimezone[];
+ 
++// Chronium (internal): comma-separated font family allowlist. Empty/absent
++// means no restriction.
++extern const char kFingerprintFonts[];
++
+ extern const char kHideCrashRestoreBubble[];
+ extern const char kHomePage[];
+ #if !BUILDFLAG(IS_ANDROID)
+diff --git a/chrome/renderer/chrome_content_renderer_client.cc b/chrome/renderer/chrome_content_renderer_client.cc
+index 3af0e8877c482..1b59f36322dce 100644
+--- a/chrome/renderer/chrome_content_renderer_client.cc
++++ b/chrome/renderer/chrome_content_renderer_client.cc
+@@ -479,6 +479,11 @@ void ChromeContentRendererClient::RenderThreadStarted() {
+     if (!tz.empty()) {
+       blink::FingerprintState::SetTimezone(tz);
+     }
++    const std::string fonts =
++        cmd_line->GetSwitchValueASCII(switches::kFingerprintFonts);
++    if (!fonts.empty()) {
++      blink::FingerprintState::SetFontsAllowlist(fonts);
++    }
+   }
+ 
+   main_thread_profiler_->SetAuxUnwinderFactory(base::BindRepeating(
+diff --git a/third_party/blink/renderer/modules/permissions/permissions.cc b/third_party/blink/renderer/modules/permissions/permissions.cc
+index 378eaa2bdeb69..f109590c4fa4c 100644
+--- a/third_party/blink/renderer/modules/permissions/permissions.cc
++++ b/third_party/blink/renderer/modules/permissions/permissions.cc
+@@ -16,6 +16,7 @@
+ #include "third_party/blink/renderer/bindings/core/v8/script_promise_resolver.h"
+ #include "third_party/blink/renderer/bindings/core/v8/script_value.h"
+ #include "third_party/blink/renderer/bindings/modules/v8/v8_permission_descriptor.h"
++#include "third_party/blink/renderer/platform/fingerprint/fingerprint_state.h"
+ #include "third_party/blink/renderer/core/dom/dom_exception.h"
+ #include "third_party/blink/renderer/core/execution_context/execution_context.h"
+ #include "third_party/blink/renderer/core/execution_context/navigator_base.h"
+@@ -289,6 +290,29 @@ void Permissions::TaskComplete(
+       resolver->GetExecutionContext()->IsContextDestroyed())
+     return;
+ 
++  // Chronium: when a fingerprint profile is active, map DENIED to ASK for
++  // the permissions that fingerprinters cross-check against the
++  // corresponding JS-visible state (Notification.permission etc.). A
++  // fresh user with no interaction yields Notification.permission ===
++  // 'default', so permissions.query({name:'notifications'}) returning
++  // 'denied' is a well-known headless-Chrome tell. We force 'prompt'
++  // here so the two sides match the real user signal.
++  if (result == mojom::blink::PermissionStatus::DENIED &&
++      FingerprintState::IsActive()) {
++    using mojom::blink::PermissionName;
++    switch (descriptor->name) {
++      case PermissionName::NOTIFICATIONS:
++      case PermissionName::GEOLOCATION:
++      case PermissionName::AUDIO_CAPTURE:
++      case PermissionName::VIDEO_CAPTURE:
++      case PermissionName::MIDI:
++        result = mojom::blink::PermissionStatus::ASK;
++        break;
++      default:
++        break;
++    }
++  }
++
+   PermissionStatusListener* listener =
+       GetOrCreatePermissionStatusListener(result, std::move(descriptor));
+   if (listener)
+diff --git a/third_party/blink/renderer/platform/fingerprint/fingerprint_state.cc b/third_party/blink/renderer/platform/fingerprint/fingerprint_state.cc
+index 8dd88ce1ee309..4428759e7c6c3 100644
+--- a/third_party/blink/renderer/platform/fingerprint/fingerprint_state.cc
++++ b/third_party/blink/renderer/platform/fingerprint/fingerprint_state.cc
+@@ -51,6 +51,13 @@ std::string& TimezoneStorage() {
+ }
+ std::atomic<bool> g_timezone_set{false};
+ 
++// Lowercased font names separated by '\n' for stable substring matching.
++std::string& FontsAllowlistStorage() {
++  static base::NoDestructor<std::string> s;
++  return *s;
++}
++std::atomic<bool> g_fonts_allowlist_set{false};
++
+ FingerprintState::ScreenFp& ScreenStorage() {
+   // POD with trivial destructor — base::NoDestructor would static-assert.
+   static FingerprintState::ScreenFp s;
+@@ -202,6 +209,58 @@ std::string_view FingerprintState::Timezone() {
+   return TimezoneStorage();
+ }
+ 
++// static
++void FingerprintState::SetFontsAllowlist(std::string_view csv) {
++  if (g_fonts_allowlist_set.load(std::memory_order_acquire) || csv.empty()) {
++    return;
++  }
++  // Store as "\n<lower>\n<lower>\n..." so we can match
++  // "\n<lower>\n" without splitting at lookup time.
++  std::string& out = FontsAllowlistStorage();
++  out = "\n";
++  std::string current;
++  for (char c : csv) {
++    if (c == ',') {
++      if (!current.empty()) {
++        out += current;
++        out += '\n';
++        current.clear();
++      }
++    } else if (c == ' ' || c == '\t') {
++      current += c;
++    } else {
++      // ASCII tolower; non-ASCII chars left as-is (acceptable: font names
++      // we ship in profiles are ASCII).
++      current += (c >= 'A' && c <= 'Z') ? (c + ('a' - 'A')) : c;
++    }
++  }
++  if (!current.empty()) {
++    out += current;
++    out += '\n';
++  }
++  g_fonts_allowlist_set.store(true, std::memory_order_release);
++}
++
++// static
++bool FingerprintState::IsFontAllowed(std::string_view family) {
++  if (!g_fonts_allowlist_set.load(std::memory_order_acquire)) {
++    return true;
++  }
++  if (family.empty()) {
++    return true;
++  }
++  std::string needle = "\n";
++  for (char c : family) {
++    if (c == ' ' || c == '\t') {
++      needle += c;
++    } else {
++      needle += (c >= 'A' && c <= 'Z') ? (c + ('a' - 'A')) : c;
++    }
++  }
++  needle += '\n';
++  return FontsAllowlistStorage().find(needle) != std::string::npos;
++}
++
+ // static
+ void FingerprintState::SetScreen(const ScreenFp& screen) {
+   if (g_screen_set.load(std::memory_order_acquire) || screen.width <= 0 ||
+diff --git a/third_party/blink/renderer/platform/fingerprint/fingerprint_state.h b/third_party/blink/renderer/platform/fingerprint/fingerprint_state.h
+index 4377bdd314bc6..94d8a66fa9398 100644
+--- a/third_party/blink/renderer/platform/fingerprint/fingerprint_state.h
++++ b/third_party/blink/renderer/platform/fingerprint/fingerprint_state.h
+@@ -54,6 +54,14 @@ class PLATFORM_EXPORT FingerprintState {
+   static void SetTimezone(std::string_view value);
+   static std::string_view Timezone();
+ 
++  // Comma-separated allowlist of font family names. When set, fonts NOT in
++  // the list are treated as unavailable by FontCache::GetFontPlatformData,
++  // which is what local-font fingerprinters key on.
++  static void SetFontsAllowlist(std::string_view csv);
++  // True when the allowlist is unset (no restriction) OR when |family| is
++  // in the allowlist. Match is case-insensitive on ASCII.
++  static bool IsFontAllowed(std::string_view family);
++
+   // Empty when no override is in effect.
+   static std::string_view WebGLUnmaskedVendor();
+   static std::string_view WebGLUnmaskedRenderer();
+diff --git a/third_party/blink/renderer/platform/fonts/font_cache.cc b/third_party/blink/renderer/platform/fonts/font_cache.cc
+index 75cc0b764f8c4..cb2e0ac682dce 100644
+--- a/third_party/blink/renderer/platform/fonts/font_cache.cc
++++ b/third_party/blink/renderer/platform/fonts/font_cache.cc
+@@ -47,6 +47,7 @@
+ #include "third_party/blink/renderer/platform/font_family_names.h"
+ #include "third_party/blink/renderer/platform/fonts/alternate_font_family.h"
+ #include "third_party/blink/renderer/platform/fonts/font_cache_client.h"
++#include "third_party/blink/renderer/platform/fingerprint/fingerprint_state.h"
+ #include "third_party/blink/renderer/platform/fonts/font_data_cache.h"
+ #include "third_party/blink/renderer/platform/fonts/font_description.h"
+ #include "third_party/blink/renderer/platform/fonts/font_fallback_map.h"
+@@ -141,6 +142,18 @@ const FontPlatformData* FontCache::GetFontPlatformData(
+   }
+ #endif
+ 
++  // Chronium: when a profile allowlist is set, hide local fonts whose family
++  // name isn't in the list. Treating them as unavailable makes
++  // CanvasRenderingContext2D.measureText fall through to the fallback chain,
++  // which is precisely what local-font fingerprinters key on.
++  if (creation_params.CreationType() == kCreateFontByFamily) {
++    const AtomicString& family = creation_params.Family();
++    if (!family.empty() &&
++        !FingerprintState::IsFontAllowed(family.Utf8().c_str())) {
++      return nullptr;
++    }
++  }
++
+   return font_platform_data_cache_.GetOrCreateFontPlatformData(
+       this, font_description, creation_params, alternate_font_name);
+ }
+-- 
+2.54.0.windows.1
+

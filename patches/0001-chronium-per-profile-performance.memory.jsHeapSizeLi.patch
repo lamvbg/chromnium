@@ -1,0 +1,843 @@
+From 284ad966da5afe9c4b459c533ffebb7446d5d019 Mon Sep 17 00:00:00 2001
+From: Chronium <chronium@interlink.local>
+Date: Mon, 8 Jun 2026 17:27:41 +0700
+Subject: [PATCH] chronium: per-profile performance.memory.jsHeapSizeLimit +
+ navigator.connection (effectiveType,downlink,rtt,saveData) + storage.estimate
+ quota + speechSynthesis.getVoices()
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds patch 0015 with 4 new fingerprint vectors, closing the gap vs ShardX
+which a side-by-side TLS fingerprint comparison showed bypasses Cloudflare
+Enterprise (grok.com) by surfacing this fuller set.
+
+- FingerprintState gains MemoryFp / ConnectionFp / StorageFp /
+  WebGLLimitsFp / VoiceList. SpeechVoices storage is a single TSV blob
+  parsed on demand to avoid heap churn.
+- 5 new switches (kFingerprintMemory, ...Connection, ...StorageQuota,
+  ...WebGLLimits, ...SpeechVoices). FingerprintProfile parses 'memory',
+  'connection', 'storage_estimate', 'webgl.max_*', 'speech.voices'
+  from the profile JSON; chrome_content_browser_client appends to the
+  renderer command line; chrome_content_renderer_client routes them
+  into FingerprintState during RenderThreadStarted.
+- Speech voices blob is hex-encoded over the CLI: voice names carry
+  UTF-8 multibyte chars (français, 日本語) that AppendSwitchASCII
+  mangles, and the TSV delimiters (\t \n) confuse CommandLineToArgvW.
+- memory_info: override is applied in MemoryInfo's ctor AFTER the cache's
+  QuantizeMemorySize step, so the profile value is the final js_heap_size_limit
+  the JS sees. Pinning in GetHeapSize() alone is overwritten by the
+  bucket-rounding path inside HeapSizeCache::Update.
+- speech_synthesis: getVoices() returns the spoofed list directly and
+  OnSetVoiceList is gated by a new fingerprint_voices_active_ flag so a
+  late mojom reply can't race-overwrite the spoofed list.
+---
+ .../browser/chrome_content_browser_client.cc  |  30 ++++
+ .../fingerprint/fingerprint_profile.cc        | 122 +++++++++++++
+ .../browser/fingerprint/fingerprint_profile.h |  18 ++
+ chrome/common/chrome_switches.cc              |   5 +
+ chrome/common/chrome_switches.h               |  23 +++
+ .../chrome_content_renderer_client.cc         |  64 +++++++
+ .../blink/renderer/core/timing/memory_info.cc |  10 ++
+ .../modules/netinfo/network_information.cc    |  29 ++++
+ .../renderer/modules/quota/storage_manager.cc |  13 +-
+ .../modules/speech/speech_synthesis.cc        |  31 ++++
+ .../modules/speech/speech_synthesis.h         |   5 +
+ .../platform/fingerprint/fingerprint_state.cc | 164 ++++++++++++++++++
+ .../platform/fingerprint/fingerprint_state.h  |  57 ++++++
+ 13 files changed, 570 insertions(+), 1 deletion(-)
+
+diff --git a/chrome/browser/chrome_content_browser_client.cc b/chrome/browser/chrome_content_browser_client.cc
+index c261099fb25ab..0220d6161f820 100644
+--- a/chrome/browser/chrome_content_browser_client.cc
++++ b/chrome/browser/chrome_content_browser_client.cc
+@@ -2859,6 +2859,36 @@ void ChromeContentBrowserClient::AppendExtraCommandLineSwitches(
+       if (!fonts.empty()) {
+         command_line->AppendSwitchASCII(switches::kFingerprintFonts, fonts);
+       }
++      const std::string memory = fp->MemoryHeapValue();
++      if (!memory.empty()) {
++        command_line->AppendSwitchASCII(switches::kFingerprintMemory, memory);
++      }
++      const std::string conn = fp->ConnectionCsv();
++      if (!conn.empty()) {
++        command_line->AppendSwitchASCII(switches::kFingerprintConnection,
++                                        conn);
++      }
++      const std::string storage_quota = fp->StorageQuotaValue();
++      if (!storage_quota.empty()) {
++        command_line->AppendSwitchASCII(switches::kFingerprintStorageQuota,
++                                        storage_quota);
++      }
++      const std::string webgl_limits = fp->WebGLLimitsCsv();
++      if (!webgl_limits.empty()) {
++        command_line->AppendSwitchASCII(switches::kFingerprintWebGLLimits,
++                                        webgl_limits);
++      }
++      const std::string voices = fp->SpeechVoicesBlob();
++      if (!voices.empty()) {
++        // Voice names can contain UTF-8 multibyte chars (français, 日本語)
++        // and the blob delimiters are \t + \n. Both confuse the
++        // platform argv parser (CommandLineToArgvW splits on whitespace,
++        // AppendSwitchASCII clips multibyte). Hex-encode so the value is
++        // ASCII and free of separators; renderer reverses it.
++        command_line->AppendSwitchASCII(
++            switches::kFingerprintSpeechVoices,
++            base::HexEncode(base::as_byte_span(voices)));
++      }
+     }
+   }
+ #if BUILDFLAG(IS_MAC)
+diff --git a/chrome/browser/fingerprint/fingerprint_profile.cc b/chrome/browser/fingerprint/fingerprint_profile.cc
+index 77716f202dc71..7dfb851ae6310 100644
+--- a/chrome/browser/fingerprint/fingerprint_profile.cc
++++ b/chrome/browser/fingerprint/fingerprint_profile.cc
+@@ -279,6 +279,128 @@ std::string FingerprintProfile::AcceptLanguageCsv() const {
+   return al ? *al : std::string();
+ }
+ 
++std::string FingerprintProfile::MemoryHeapValue() const {
++  if (!loaded_) {
++    return {};
++  }
++  const base::DictValue* mem = dict_.FindDict("memory");
++  if (!mem) {
++    return {};
++  }
++  // JSON stores integers as int (32-bit). For 4 GB heap_size_limit we need
++  // 64-bit. Accept either number (which can lose precision past 2^53) or a
++  // string-encoded integer for exactness.
++  if (const std::string* s = mem->FindString("heap_size_limit")) {
++    return *s;
++  }
++  std::optional<double> d = mem->FindDouble("heap_size_limit");
++  if (!d.has_value() || *d <= 0.0) {
++    return {};
++  }
++  return base::StringPrintf("%llu",
++                            static_cast<unsigned long long>(*d));
++}
++
++std::string FingerprintProfile::ConnectionCsv() const {
++  if (!loaded_) {
++    return {};
++  }
++  const base::DictValue* conn = dict_.FindDict("connection");
++  if (!conn) {
++    return {};
++  }
++  const std::string* etype = conn->FindString("effective_type");
++  if (!etype || etype->empty()) {
++    return {};
++  }
++  double downlink = conn->FindDouble("downlink_mbps").value_or(10.0);
++  int rtt = conn->FindInt("rtt_msec").value_or(50);
++  bool save_data = conn->FindBool("save_data").value_or(false);
++  return base::StringPrintf("%s,%g,%d,%d", etype->c_str(), downlink, rtt,
++                            save_data ? 1 : 0);
++}
++
++std::string FingerprintProfile::StorageQuotaValue() const {
++  if (!loaded_) {
++    return {};
++  }
++  const base::DictValue* st = dict_.FindDict("storage_estimate");
++  if (!st) {
++    return {};
++  }
++  if (const std::string* s = st->FindString("quota_bytes")) {
++    return *s;
++  }
++  std::optional<double> gb = st->FindDouble("quota_gb");
++  if (gb.has_value() && *gb > 0.0) {
++    uint64_t bytes = static_cast<uint64_t>(*gb * 1024.0 * 1024.0 * 1024.0);
++    return base::StringPrintf("%llu",
++                              static_cast<unsigned long long>(bytes));
++  }
++  return {};
++}
++
++std::string FingerprintProfile::WebGLLimitsCsv() const {
++  if (!loaded_) {
++    return {};
++  }
++  const base::DictValue* webgl = dict_.FindDict("webgl");
++  if (!webgl) {
++    return {};
++  }
++  int max_tex = webgl->FindInt("max_texture_size").value_or(0);
++  int max_vtx = webgl->FindInt("max_vertex_attribs").value_or(0);
++  if (max_tex <= 0 && max_vtx <= 0) {
++    return {};
++  }
++  return base::StringPrintf("%d,%d", max_tex, max_vtx);
++}
++
++std::string FingerprintProfile::SpeechVoicesBlob() const {
++  if (!loaded_) {
++    return {};
++  }
++  // Either profile.speech.voices (ShardX convention) or profile.speech_voices.
++  const base::ListValue* voices = nullptr;
++  if (const base::DictValue* speech = dict_.FindDict("speech")) {
++    voices = speech->FindList("voices");
++  }
++  if (!voices) {
++    voices = dict_.FindList("speech_voices");
++  }
++  if (!voices || voices->empty()) {
++    return {};
++  }
++  std::string out;
++  for (const auto& v : *voices) {
++    const base::DictValue* d = v.GetIfDict();
++    if (!d) {
++      continue;
++    }
++    const std::string* name = d->FindString("name");
++    const std::string* lang = d->FindString("lang");
++    if (!name || !lang || name->empty() || lang->empty()) {
++      continue;
++    }
++    bool is_default = d->FindBool("is_default").value_or(false);
++    bool local = d->FindBool("local_service").value_or(false);
++    const std::string* uri = d->FindString("voice_uri");
++    if (!out.empty()) {
++      out += '\n';
++    }
++    out += *name;
++    out += '\t';
++    out += *lang;
++    out += '\t';
++    out += is_default ? '1' : '0';
++    out += '\t';
++    out += local ? '1' : '0';
++    out += '\t';
++    out += (uri && !uri->empty()) ? *uri : *name;
++  }
++  return out;
++}
++
+ bool FingerprintProfile::LoadFromFile(const base::FilePath& path) {
+   std::string contents;
+   if (!base::ReadFileToString(path, &contents)) {
+diff --git a/chrome/browser/fingerprint/fingerprint_profile.h b/chrome/browser/fingerprint/fingerprint_profile.h
+index 57cdf6fe84749..24269ee4b912e 100644
+--- a/chrome/browser/fingerprint/fingerprint_profile.h
++++ b/chrome/browser/fingerprint/fingerprint_profile.h
+@@ -107,6 +107,24 @@ class FingerprintProfile : public chrome::mojom::FingerprintConfigProvider {
+   // Empty = no restriction.
+   std::string FontsCsv() const;
+ 
++  // performance.memory.jsHeapSizeLimit override, as a decimal string of
++  // bytes ready for AppendSwitchASCII. Empty = no override.
++  std::string MemoryHeapValue() const;
++
++  // navigator.connection: "effective_type,downlink_mbps,rtt_msec,save_data".
++  // Empty = no override.
++  std::string ConnectionCsv() const;
++
++  // navigator.storage.estimate() quota as decimal bytes. Empty = no override.
++  std::string StorageQuotaValue() const;
++
++  // WebGL "max_texture,max_vertex". Empty = no override.
++  std::string WebGLLimitsCsv() const;
++
++  // speechSynthesis.getVoices() as a TSV blob (see kFingerprintSpeechVoices
++  // doc in chrome_switches.h). Empty = no override.
++  std::string SpeechVoicesBlob() const;
++
+  private:
+   friend class base::NoDestructor<FingerprintProfile>;
+   FingerprintProfile();
+diff --git a/chrome/common/chrome_switches.cc b/chrome/common/chrome_switches.cc
+index 109dd509dcdd5..e4a23d1a7235c 100644
+--- a/chrome/common/chrome_switches.cc
++++ b/chrome/common/chrome_switches.cc
+@@ -370,6 +370,11 @@ const char kFingerprintWebRtcPolicy[] = "fingerprint-webrtc-policy";
+ const char kFingerprintAcceptLanguage[] = "fingerprint-accept-language";
+ const char kFingerprintTimezone[] = "fingerprint-timezone";
+ const char kFingerprintFonts[] = "fingerprint-fonts";
++const char kFingerprintMemory[] = "fingerprint-memory";
++const char kFingerprintConnection[] = "fingerprint-connection";
++const char kFingerprintStorageQuota[] = "fingerprint-storage-quota";
++const char kFingerprintWebGLLimits[] = "fingerprint-webgl-limits";
++const char kFingerprintSpeechVoices[] = "fingerprint-speech-voices";
+ 
+ // Does not show the crash restore bubble when the browser is started during the
+ // system startup phase in ChromeOS, if the ChromeOS full restore feature is
+diff --git a/chrome/common/chrome_switches.h b/chrome/common/chrome_switches.h
+index 867970c551333..6607fb29571f5 100644
+--- a/chrome/common/chrome_switches.h
++++ b/chrome/common/chrome_switches.h
+@@ -170,6 +170,29 @@ extern const char kFingerprintTimezone[];
+ // means no restriction.
+ extern const char kFingerprintFonts[];
+ 
++// Chronium (internal): performance.memory.jsHeapSizeLimit override.
++// Format: single integer (bytes), e.g. "4294705152" for 4GB.
++extern const char kFingerprintMemory[];
++
++// Chronium (internal): navigator.connection override.
++// Format: "effective_type,downlink_mbps,rtt_msec,save_data(0|1)"
++// e.g. "4g,10.0,75,0".
++extern const char kFingerprintConnection[];
++
++// Chronium (internal): navigator.storage.estimate() quota override (bytes).
++// Single integer, e.g. "10737418240" for 10 GB.
++extern const char kFingerprintStorageQuota[];
++
++// Chronium (internal): WebGL GL_MAX_TEXTURE_SIZE / GL_MAX_VERTEX_ATTRIBS
++// limits override. Format: "max_texture,max_vertex". e.g. "32768,16".
++extern const char kFingerprintWebGLLimits[];
++
++// Chronium (internal): speechSynthesis.getVoices() override.
++// Format: newline-separated lines, each "name<tab>lang<tab>default(0|1)
++// <tab>local(0|1)<tab>uri". URL-decoded; this flag must be base16-encoded
++// in the command line to survive the platform argv parser.
++extern const char kFingerprintSpeechVoices[];
++
+ extern const char kHideCrashRestoreBubble[];
+ extern const char kHomePage[];
+ #if !BUILDFLAG(IS_ANDROID)
+diff --git a/chrome/renderer/chrome_content_renderer_client.cc b/chrome/renderer/chrome_content_renderer_client.cc
+index 1b59f36322dce..9124089046f6e 100644
+--- a/chrome/renderer/chrome_content_renderer_client.cc
++++ b/chrome/renderer/chrome_content_renderer_client.cc
+@@ -484,6 +484,70 @@ void ChromeContentRendererClient::RenderThreadStarted() {
+     if (!fonts.empty()) {
+       blink::FingerprintState::SetFontsAllowlist(fonts);
+     }
++    const std::string memory_bytes =
++        cmd_line->GetSwitchValueASCII(switches::kFingerprintMemory);
++    if (!memory_bytes.empty()) {
++      uint64_t bytes = 0;
++      if (base::StringToUint64(memory_bytes, &bytes) && bytes > 0) {
++        blink::FingerprintState::MemoryFp m;
++        m.heap_size_limit = bytes;
++        blink::FingerprintState::SetMemory(m);
++      }
++    }
++    const std::string conn_csv =
++        cmd_line->GetSwitchValueASCII(switches::kFingerprintConnection);
++    if (!conn_csv.empty()) {
++      std::vector<std::string> parts = base::SplitString(
++          conn_csv, ",", base::TRIM_WHITESPACE, base::SPLIT_WANT_ALL);
++      if (parts.size() == 4) {
++        blink::FingerprintState::ConnectionFp c;
++        int rtt = 0;
++        int save = 0;
++        if (base::StringToDouble(parts[1], &c.downlink_mbps) &&
++            base::StringToInt(parts[2], &rtt) &&
++            base::StringToInt(parts[3], &save) && !parts[0].empty()) {
++          c.effective_type = parts[0];
++          c.rtt_msec = static_cast<uint32_t>(rtt);
++          c.save_data = (save != 0);
++          blink::FingerprintState::SetConnection(c);
++        }
++      }
++    }
++    const std::string quota_bytes =
++        cmd_line->GetSwitchValueASCII(switches::kFingerprintStorageQuota);
++    if (!quota_bytes.empty()) {
++      uint64_t bytes = 0;
++      if (base::StringToUint64(quota_bytes, &bytes) && bytes > 0) {
++        blink::FingerprintState::StorageFp s;
++        s.quota_bytes = bytes;
++        blink::FingerprintState::SetStorage(s);
++      }
++    }
++    const std::string webgl_limits =
++        cmd_line->GetSwitchValueASCII(switches::kFingerprintWebGLLimits);
++    if (!webgl_limits.empty()) {
++      std::vector<std::string> parts = base::SplitString(
++          webgl_limits, ",", base::TRIM_WHITESPACE, base::SPLIT_WANT_ALL);
++      if (parts.size() == 2) {
++        blink::FingerprintState::WebGLLimitsFp w;
++        if (base::StringToInt(parts[0], &w.max_texture_size) &&
++            base::StringToInt(parts[1], &w.max_vertex_attribs)) {
++          blink::FingerprintState::SetWebGLLimits(w);
++        }
++      }
++    }
++    const std::string voices_hex =
++        cmd_line->GetSwitchValueASCII(switches::kFingerprintSpeechVoices);
++    if (!voices_hex.empty()) {
++      std::vector<uint8_t> voices_bytes;
++      if (base::HexStringToBytes(voices_hex, &voices_bytes) &&
++          !voices_bytes.empty()) {
++        std::string_view voices_blob(
++            reinterpret_cast<const char*>(voices_bytes.data()),
++            voices_bytes.size());
++        blink::FingerprintState::SetSpeechVoices(voices_blob);
++      }
++    }
+   }
+ 
+   main_thread_profiler_->SetAuxUnwinderFactory(base::BindRepeating(
+diff --git a/third_party/blink/renderer/core/timing/memory_info.cc b/third_party/blink/renderer/core/timing/memory_info.cc
+index b17ada56e6d93..64890dad03460 100644
+--- a/third_party/blink/renderer/core/timing/memory_info.cc
++++ b/third_party/blink/renderer/core/timing/memory_info.cc
+@@ -35,6 +35,7 @@
+ #include "base/time/default_tick_clock.h"
+ #include "base/time/time.h"
+ #include "third_party/blink/renderer/core/frame/settings.h"
++#include "third_party/blink/renderer/platform/fingerprint/fingerprint_state.h"
+ #include "third_party/blink/renderer/platform/runtime_enabled_features.h"
+ #include "third_party/blink/renderer/platform/wtf/math_extras.h"
+ #include "v8/include/v8.h"
+@@ -169,6 +170,15 @@ MemoryInfo::MemoryInfo(Precision precision) {
+     GetHeapSize(info_);
+   else
+     HeapSizeCache::ForCurrentThread().GetCachedHeapSize(info_, precision);
++  // Chronium: pin js_heap_size_limit to the profile-supplied value AFTER
++  // any QuantizeMemorySize bucketing has been applied inside the cache.
++  // Real V8 returns ~3.76 GB-bucketed on this device, leaking the actual
++  // heap configuration; ShardX-style profiles want a clean 4 GB value.
++  // We do this here instead of in GetHeapSize() so the override is the
++  // last word, surviving the cache's quantization step.
++  if (const auto* m = FingerprintState::Memory(); m) {
++    info_.js_heap_size_limit = static_cast<size_t>(m->heap_size_limit);
++  }
+   // The values must have been computed, so totalJSHeapSize must be greater than
+   // 0.
+   DCHECK_GT(totalJSHeapSize(), 0u);
+diff --git a/third_party/blink/renderer/modules/netinfo/network_information.cc b/third_party/blink/renderer/modules/netinfo/network_information.cc
+index 976a3c8c36dbf..97a5396a264bc 100644
+--- a/third_party/blink/renderer/modules/netinfo/network_information.cc
++++ b/third_party/blink/renderer/modules/netinfo/network_information.cc
+@@ -17,6 +17,7 @@
+ #include "third_party/blink/renderer/core/inspector/console_message.h"
+ #include "third_party/blink/renderer/core/probe/core_probes.h"
+ #include "third_party/blink/renderer/modules/event_target_modules.h"
++#include "third_party/blink/renderer/platform/fingerprint/fingerprint_state.h"
+ #include "third_party/blink/renderer/platform/heap/garbage_collected.h"
+ #include "third_party/blink/renderer/platform/runtime_enabled_features.h"
+ #include "third_party/blink/renderer/platform/supplementable.h"
+@@ -27,6 +28,21 @@ namespace blink {
+ 
+ namespace {
+ 
++V8EffectiveConnectionType::Enum ParseEffectiveType(const std::string& s) {
++  if (s == "slow-2g" || s == "slow2g") {
++    return V8EffectiveConnectionType::Enum::kSlow2G;
++  }
++  if (s == "2g") {
++    return V8EffectiveConnectionType::Enum::k2G;
++  }
++  if (s == "3g") {
++    return V8EffectiveConnectionType::Enum::k3G;
++  }
++  // "4g" and anything unknown -> 4g (same as upstream's
++  // EffectiveConnectionTypeToEnum default).
++  return V8EffectiveConnectionType::Enum::k4G;
++}
++
+ V8ConnectionType::Enum ConnectionTypeToEnum(WebConnectionType type) {
+   switch (type) {
+     case kWebConnectionTypeCellular2G:
+@@ -111,6 +127,10 @@ double NetworkInformation::downlinkMax() const {
+ }
+ 
+ V8EffectiveConnectionType NetworkInformation::effectiveType() {
++  // Chronium: per-profile override returns immediately.
++  if (const auto* c = FingerprintState::Connection(); c) {
++    return V8EffectiveConnectionType(ParseEffectiveType(c->effective_type));
++  }
+   MaybeShowWebHoldbackConsoleMsg();
+   std::optional<WebEffectiveConnectionType> override_ect =
+       GetNetworkStateNotifier().GetWebHoldbackEffectiveType();
+@@ -132,6 +152,9 @@ V8EffectiveConnectionType NetworkInformation::effectiveType() {
+ }
+ 
+ uint32_t NetworkInformation::rtt() {
++  if (const auto* c = FingerprintState::Connection(); c) {
++    return c->rtt_msec;
++  }
+   MaybeShowWebHoldbackConsoleMsg();
+   std::optional<base::TimeDelta> override_rtt =
+       GetNetworkStateNotifier().GetWebHoldbackHttpRtt();
+@@ -148,6 +171,9 @@ uint32_t NetworkInformation::rtt() {
+ }
+ 
+ double NetworkInformation::downlink() {
++  if (const auto* c = FingerprintState::Connection(); c) {
++    return c->downlink_mbps;
++  }
+   MaybeShowWebHoldbackConsoleMsg();
+   std::optional<double> override_downlink_mbps =
+       GetNetworkStateNotifier().GetWebHoldbackDownlinkThroughputMbps();
+@@ -165,6 +191,9 @@ double NetworkInformation::downlink() {
+ }
+ 
+ bool NetworkInformation::saveData() const {
++  if (const auto* c = FingerprintState::Connection(); c) {
++    return c->save_data;
++  }
+   bool save_data =
+       IsObserving() ? save_data_ : GetNetworkStateNotifier().SaveDataEnabled();
+ 
+diff --git a/third_party/blink/renderer/modules/quota/storage_manager.cc b/third_party/blink/renderer/modules/quota/storage_manager.cc
+index ef1c723ac27d3..a79fe4a6cd87d 100644
+--- a/third_party/blink/renderer/modules/quota/storage_manager.cc
++++ b/third_party/blink/renderer/modules/quota/storage_manager.cc
+@@ -22,6 +22,7 @@
+ #include "third_party/blink/renderer/modules/permissions/permission_utils.h"
+ #include "third_party/blink/renderer/modules/quota/quota_utils.h"
+ #include "third_party/blink/renderer/platform/bindings/v8_throw_exception.h"
++#include "third_party/blink/renderer/platform/fingerprint/fingerprint_state.h"
+ #include "third_party/blink/renderer/platform/heap/garbage_collected.h"
+ #include "third_party/blink/renderer/platform/instrumentation/use_counter.h"
+ #include "third_party/blink/renderer/platform/wtf/assertions.h"
+@@ -70,7 +71,17 @@ void QueryStorageUsageAndQuotaCallback(
+ 
+   StorageEstimate* estimate = StorageEstimate::Create();
+   estimate->setUsage(usage_in_bytes);
+-  estimate->setQuota(quota_in_bytes);
++  // Chronium: per-profile override of the quota field. Real Chrome
++  // computes quota from available disk space at the storage partition,
++  // which directly leaks the host device's free space. Pin to the
++  // profile's value so it's stable across launches and matches the
++  // claimed device class.
++  if (const auto* s = FingerprintState::Storage();
++      s && s->quota_bytes > 0) {
++    estimate->setQuota(static_cast<int64_t>(s->quota_bytes));
++  } else {
++    estimate->setQuota(quota_in_bytes);
++  }
+ 
+   // We only want to show usage details for systems that are used by the app,
+   // this way we do not create any web compatibility issues by unecessarily
+diff --git a/third_party/blink/renderer/modules/speech/speech_synthesis.cc b/third_party/blink/renderer/modules/speech/speech_synthesis.cc
+index 2327015bc565b..08047e833c247 100644
+--- a/third_party/blink/renderer/modules/speech/speech_synthesis.cc
++++ b/third_party/blink/renderer/modules/speech/speech_synthesis.cc
+@@ -43,6 +43,7 @@
+ #include "third_party/blink/renderer/modules/speech/speech_synthesis_error_event.h"
+ #include "third_party/blink/renderer/modules/speech/speech_synthesis_event.h"
+ #include "third_party/blink/renderer/modules/speech/speech_synthesis_voice.h"
++#include "third_party/blink/renderer/platform/fingerprint/fingerprint_state.h"
+ #include "third_party/blink/renderer/platform/instrumentation/use_counter.h"
+ 
+ namespace blink {
+@@ -87,6 +88,13 @@ SpeechSynthesis::SpeechSynthesis(LocalDOMWindow& window)
+ 
+ void SpeechSynthesis::OnSetVoiceList(
+     Vector<mojom::blink::SpeechSynthesisVoicePtr> mojom_voices) {
++  // Chronium: ignore late mojom responses when we've already returned a
++  // spoofed list to JS. The mojom backend keeps streaming updates as TTS
++  // platforms enumerate; without this guard the real voice list would
++  // race-overwrite ours.
++  if (fingerprint_voices_active_) {
++    return;
++  }
+   voice_list_.clear();
+   for (auto& mojom_voice : mojom_voices) {
+     voice_list_.push_back(
+@@ -96,6 +104,29 @@ void SpeechSynthesis::OnSetVoiceList(
+ }
+ 
+ const HeapVector<Member<SpeechSynthesisVoice>>& SpeechSynthesis::getVoices() {
++  // Chronium: when a profile pins a voice list, return it and skip the
++  // mojom roundtrip entirely. The OS's installed voices leak the platform
++  // (macOS has Alex/Samantha, Windows has Microsoft Zira/David, Linux has
++  // espeak set) and are a high-signal cross-check vector for UA spoofing.
++  if (FingerprintState::HasSpeechVoices()) {
++    if (!fingerprint_voices_active_) {
++      voice_list_.clear();
++      auto voices = FingerprintState::SpeechVoices();
++      fingerprint_voice_count_ = voices.size();
++      for (const auto& v : voices) {
++        auto mojom_voice = mojom::blink::SpeechSynthesisVoice::New();
++        mojom_voice->name = String::FromUtf8(v.name);
++        mojom_voice->lang = String::FromUtf8(v.lang);
++        mojom_voice->voice_uri = String::FromUtf8(v.uri);
++        mojom_voice->is_default = v.is_default;
++        mojom_voice->is_local_service = v.local_service;
++        voice_list_.push_back(MakeGarbageCollected<SpeechSynthesisVoice>(
++            std::move(mojom_voice)));
++      }
++      fingerprint_voices_active_ = true;
++    }
++    return voice_list_;
++  }
+   // Kick off initialization here to ensure voice list gets populated.
+   std::ignore = TryEnsureMojomSynthesis();
+   return voice_list_;
+diff --git a/third_party/blink/renderer/modules/speech/speech_synthesis.h b/third_party/blink/renderer/modules/speech/speech_synthesis.h
+index 467ba4ac77d40..57c56d88a67c4 100644
+--- a/third_party/blink/renderer/modules/speech/speech_synthesis.h
++++ b/third_party/blink/renderer/modules/speech/speech_synthesis.h
+@@ -145,6 +145,11 @@ class MODULES_EXPORT SpeechSynthesis final
+   HeapVector<Member<SpeechSynthesisVoice>> voice_list_;
+   HeapDeque<Member<SpeechSynthesisUtterance>> utterance_queue_;
+   bool is_paused_ = false;
++  // Chronium: true when voice_list_ holds the spoofed list from
++  // FingerprintState. Guards both getVoices() (skip the mojom roundtrip)
++  // and OnSetVoiceList() (don't let a late mojom response overwrite us).
++  bool fingerprint_voices_active_ = false;
++  size_t fingerprint_voice_count_ = 0;
+ 
+   // EventTarget
+   const AtomicString& InterfaceName() const override;
+diff --git a/third_party/blink/renderer/platform/fingerprint/fingerprint_state.cc b/third_party/blink/renderer/platform/fingerprint/fingerprint_state.cc
+index 4428759e7c6c3..aab82da1d9624 100644
+--- a/third_party/blink/renderer/platform/fingerprint/fingerprint_state.cc
++++ b/third_party/blink/renderer/platform/fingerprint/fingerprint_state.cc
+@@ -79,6 +79,38 @@ std::atomic<bool> g_battery_set{false};
+ 
+ std::atomic<int> g_webrtc_policy{0};
+ 
++FingerprintState::MemoryFp& MemoryStorage() {
++  static FingerprintState::MemoryFp s;
++  return s;
++}
++std::atomic<bool> g_memory_set{false};
++
++FingerprintState::ConnectionFp& ConnectionStorage() {
++  static base::NoDestructor<FingerprintState::ConnectionFp> s;
++  return *s;
++}
++std::atomic<bool> g_connection_set{false};
++
++FingerprintState::StorageFp& StorageStorage() {
++  static FingerprintState::StorageFp s;
++  return s;
++}
++std::atomic<bool> g_storage_set{false};
++
++FingerprintState::WebGLLimitsFp& WebGLLimitsStorage() {
++  static FingerprintState::WebGLLimitsFp s;
++  return s;
++}
++std::atomic<bool> g_webgl_limits_set{false};
++
++// Stored as raw TSV blob; parsed lazily on each SpeechVoices() call.
++// SpeechSynthesis::getVoices() is rarely hot.
++std::string& SpeechVoicesBlobStorage() {
++  static base::NoDestructor<std::string> s;
++  return *s;
++}
++std::atomic<bool> g_speech_voices_set{false};
++
+ // xxHash-style scalar mix. Cryptographically weak but plenty good for
+ // distinguishing fingerprints. Deterministic for the same (seed, channel,
+ // x, y) tuple.
+@@ -325,6 +357,138 @@ FingerprintState::WebRtcPolicy FingerprintState::GetWebRtcPolicy() {
+   return static_cast<WebRtcPolicy>(g_webrtc_policy.load(std::memory_order_acquire));
+ }
+ 
++// static
++void FingerprintState::SetMemory(const MemoryFp& memory) {
++  if (g_memory_set.load(std::memory_order_acquire) ||
++      memory.heap_size_limit == 0) {
++    return;
++  }
++  MemoryStorage() = memory;
++  g_memory_set.store(true, std::memory_order_release);
++}
++
++// static
++const FingerprintState::MemoryFp* FingerprintState::Memory() {
++  if (!g_memory_set.load(std::memory_order_acquire)) {
++    return nullptr;
++  }
++  return &MemoryStorage();
++}
++
++// static
++void FingerprintState::SetConnection(const ConnectionFp& conn) {
++  if (g_connection_set.load(std::memory_order_acquire) ||
++      conn.effective_type.empty()) {
++    return;
++  }
++  ConnectionStorage() = conn;
++  g_connection_set.store(true, std::memory_order_release);
++}
++
++// static
++const FingerprintState::ConnectionFp* FingerprintState::Connection() {
++  if (!g_connection_set.load(std::memory_order_acquire)) {
++    return nullptr;
++  }
++  return &ConnectionStorage();
++}
++
++// static
++void FingerprintState::SetStorage(const StorageFp& storage) {
++  if (g_storage_set.load(std::memory_order_acquire) ||
++      storage.quota_bytes == 0) {
++    return;
++  }
++  StorageStorage() = storage;
++  g_storage_set.store(true, std::memory_order_release);
++}
++
++// static
++const FingerprintState::StorageFp* FingerprintState::Storage() {
++  if (!g_storage_set.load(std::memory_order_acquire)) {
++    return nullptr;
++  }
++  return &StorageStorage();
++}
++
++// static
++void FingerprintState::SetWebGLLimits(const WebGLLimitsFp& limits) {
++  if (g_webgl_limits_set.load(std::memory_order_acquire) ||
++      (limits.max_texture_size <= 0 && limits.max_vertex_attribs <= 0)) {
++    return;
++  }
++  WebGLLimitsStorage() = limits;
++  g_webgl_limits_set.store(true, std::memory_order_release);
++}
++
++// static
++const FingerprintState::WebGLLimitsFp* FingerprintState::WebGLLimits() {
++  if (!g_webgl_limits_set.load(std::memory_order_acquire)) {
++    return nullptr;
++  }
++  return &WebGLLimitsStorage();
++}
++
++// static
++void FingerprintState::SetSpeechVoices(std::string_view tsv_blob) {
++  if (g_speech_voices_set.load(std::memory_order_acquire) || tsv_blob.empty()) {
++    return;
++  }
++  SpeechVoicesBlobStorage().assign(tsv_blob);
++  g_speech_voices_set.store(true, std::memory_order_release);
++}
++
++// static
++bool FingerprintState::HasSpeechVoices() {
++  return g_speech_voices_set.load(std::memory_order_acquire);
++}
++
++// static
++FingerprintState::VoiceList FingerprintState::SpeechVoices() {
++  VoiceList out;
++  if (!g_speech_voices_set.load(std::memory_order_acquire)) {
++    return out;
++  }
++  const std::string& blob = SpeechVoicesBlobStorage();
++  size_t pos = 0;
++  while (pos < blob.size()) {
++    size_t line_end = blob.find('\n', pos);
++    if (line_end == std::string::npos) {
++      line_end = blob.size();
++    }
++    std::string_view line(blob.data() + pos, line_end - pos);
++    pos = line_end + 1;
++    if (line.empty()) {
++      continue;
++    }
++    // Parse "name\tlang\tdefault\tlocal\turi" — 5 fields tab-separated.
++    VoiceFp v;
++    size_t f0 = 0;
++    int field = 0;
++    for (size_t i = 0; i <= line.size(); ++i) {
++      if (i == line.size() || line[i] == '\t') {
++        std::string_view part(line.data() + f0, i - f0);
++        switch (field) {
++          case 0: v.name = std::string(part); break;
++          case 1: v.lang = std::string(part); break;
++          case 2: v.is_default = (part == "1"); break;
++          case 3: v.local_service = (part == "1"); break;
++          case 4: v.uri = std::string(part); break;
++        }
++        ++field;
++        f0 = i + 1;
++      }
++    }
++    if (!v.name.empty() && !v.lang.empty()) {
++      if (v.uri.empty()) {
++        v.uri = v.name;  // Match Chrome convention: voiceURI defaults to name.
++      }
++      out.push_back(std::move(v));
++    }
++  }
++  return out;
++}
++
+ // static
+ uint32_t FingerprintState::HashAt(std::string_view channel,
+                                   uint32_t x,
+diff --git a/third_party/blink/renderer/platform/fingerprint/fingerprint_state.h b/third_party/blink/renderer/platform/fingerprint/fingerprint_state.h
+index 94d8a66fa9398..60a5437b47a1c 100644
+--- a/third_party/blink/renderer/platform/fingerprint/fingerprint_state.h
++++ b/third_party/blink/renderer/platform/fingerprint/fingerprint_state.h
+@@ -19,6 +19,7 @@
+ #include <cstdint>
+ #include <string>
+ #include <string_view>
++#include <vector>
+ 
+ #include "third_party/blink/renderer/platform/platform_export.h"
+ 
+@@ -112,6 +113,62 @@ class PLATFORM_EXPORT FingerprintState {
+   static void SetWebRtcPolicy(WebRtcPolicy policy);
+   static WebRtcPolicy GetWebRtcPolicy();
+ 
++  // performance.memory.jsHeapSizeLimit override. 0 = not set.
++  // The browser-side V8 limit is a runtime-derived number that leaks the
++  // device class (e.g. 4294705152 = ~4GB on high-end vs 2147483648 = 2GB
++  // on low-end). Real Chrome on real desktop reports 4294705152; we let
++  // the profile pin this to a stable value.
++  struct MemoryFp {
++    uint64_t heap_size_limit = 0;  // bytes
++  };
++  static void SetMemory(const MemoryFp& memory);
++  static const MemoryFp* Memory();
++
++  // navigator.connection: effective_type ("4g","3g","2g","slow-2g"),
++  // downlink (Mbps), rtt (ms), save_data flag. effective_type empty = not set.
++  struct ConnectionFp {
++    std::string effective_type;
++    double downlink_mbps = 0.0;
++    uint32_t rtt_msec = 0;
++    bool save_data = false;
++  };
++  static void SetConnection(const ConnectionFp& conn);
++  static const ConnectionFp* Connection();
++
++  // navigator.storage.estimate() quota override. 0 = not set.
++  struct StorageFp {
++    uint64_t quota_bytes = 0;
++  };
++  static void SetStorage(const StorageFp& storage);
++  static const StorageFp* Storage();
++
++  // WebGL parameter overrides: GL_MAX_TEXTURE_SIZE / GL_MAX_VERTEX_ATTRIBS.
++  // Both zero = no override.
++  struct WebGLLimitsFp {
++    int max_texture_size = 0;
++    int max_vertex_attribs = 0;
++  };
++  static void SetWebGLLimits(const WebGLLimitsFp& limits);
++  static const WebGLLimitsFp* WebGLLimits();
++
++  // speechSynthesis.getVoices() override. Voices are stored as a single
++  // serialized blob to avoid heap fragmentation across multiple
++  // SpeechSynthesis instances. Format: lines separated by '\n', each line
++  // is "name\tlang\tdefault(0|1)\tlocal(0|1)\turi". Empty = not set.
++  // Voices are returned as VoiceList (a vector of structs) on demand.
++  struct VoiceFp {
++    std::string name;
++    std::string lang;
++    bool is_default = false;
++    bool local_service = false;
++    std::string uri;
++  };
++  using VoiceList = std::vector<VoiceFp>;
++  static void SetSpeechVoices(std::string_view tsv_blob);
++  // Returns the parsed voice list (empty when no override).
++  static VoiceList SpeechVoices();
++  static bool HasSpeechVoices();
++
+   // Deterministic 32-bit hash of (process seed, channel, x, y).
+   // |channel| should be a short stable string identifying the fingerprint
+   // surface, e.g. "canvas", "webgl-readpixels", "audio".
+-- 
+2.54.0.windows.1
+

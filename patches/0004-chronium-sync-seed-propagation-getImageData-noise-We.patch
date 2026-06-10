@@ -1,0 +1,450 @@
+From 3b7124b3738ba3f5eeed14c40ab4d1fd8a11fa13 Mon Sep 17 00:00:00 2001
+From: Chronium Build <chronium@interlink.local>
+Date: Fri, 5 Jun 2026 16:55:09 +0700
+Subject: [PATCH 04/14] chronium: sync seed propagation, getImageData noise,
+ WebGL unmasked_* spoof
+
+Bundles three fingerprint-surface improvements that share infra
+changes (chrome_switches, content_browser_client, content_renderer_
+client). Each is independently testable and verified.
+
+A. Synchronous seed propagation (kills the canvas race)
+   Previously the seed traveled browser->renderer via async Mojo,
+   so a canvas readback from a top-level inline <script> could run
+   before the seed arrived and miss the noise. Fix: the browser now
+   appends --fingerprint-seed-hex=<64 hex chars> to every child
+   process command line via AppendExtraCommandLineSwitches, and the
+   renderer parses it in RenderThreadStarted *before* any document
+   is created. Result: canvas (and every later fingerprint vector)
+   has the seed available from the very first byte of HTML parsing.
+   The Mojo channel from patch 0002 is kept as a no-op fallback;
+   FingerprintState::Set is idempotent.
+
+B. CanvasRenderingContext2D::getImageData noise
+   Patch 0003 only noised toDataURL/toBlob. getImageData is the other
+   common readback path. After BaseRenderingContext2D's
+   getImageDataInternal calls readPixels into the returned ImageData
+   pixmap, we run the same LSB-flip loop, keyed by the same 'canvas'
+   channel and canvas-space (sx+x, sy+y) coordinates so a pixel
+   noised one way through toDataURL is noised the same way through
+   getImageData (cross-API consistency within profile).
+
+C. WebGL UNMASKED_VENDOR_WEBGL / UNMASKED_RENDERER_WEBGL spoof
+   Extends FingerprintState with SetWebGLStrings/WebGLUnmasked* and
+   FingerprintProfile with WebGLUnmaskedVendor/Renderer accessors
+   reading from the JSON 'webgl' dict. Browser propagates the two
+   strings via --fingerprint-webgl-vendor / --fingerprint-webgl-
+   renderer switches. WebGLRenderingContextBase::getParameter's
+   case branches for kUnmaskedRendererWebgl (37446) and
+   kUnmaskedVendorWebgl (37445) now return the spoofed strings
+   when set; falls through to the real driver values otherwise.
+
+Verified A+B+C on a single test page:
+- profile A: toDataURL hash -356449597, getImageData sum 93240642,
+  UNMASKED_VENDOR NVIDIA Corporation, UNMASKED_RENDERER NVIDIA
+  GeForce RTX 3060/PCIe/SSE2
+- profile B: toDataURL hash 1834648629, getImageData sum -74073189,
+  UNMASKED_VENDOR Intel Inc., UNMASKED_RENDERER Intel(R) UHD
+  Graphics 630
+All hashes deterministic across multiple reads within a profile.
+
+Files touched:
+- chrome/common/chrome_switches.{h,cc}      (3 new switches)
+- chrome/browser/chrome_content_browser_client.cc
+                                            (append switches)
+- chrome/renderer/chrome_content_renderer_client.cc
+                                            (parse switches early)
+- chrome/browser/fingerprint/fingerprint_profile.{h,cc}
+                                            (WebGL accessors)
+- third_party/blink/renderer/platform/fingerprint/
+    fingerprint_state.{h,cc}                (WebGL strings storage)
+- third_party/blink/renderer/modules/canvas/canvas2d/
+    base_rendering_context_2d.cc            (getImageData noise)
+- third_party/blink/renderer/modules/webgl/
+    webgl_rendering_context_base.cc         (UNMASKED_* spoof)
+---
+ .../browser/chrome_content_browser_client.cc  | 24 +++++++++++
+ .../fingerprint/fingerprint_profile.cc        | 24 +++++++++++
+ .../browser/fingerprint/fingerprint_profile.h |  6 +++
+ chrome/common/chrome_switches.cc              |  8 ++++
+ chrome/common/chrome_switches.h               | 13 ++++++
+ .../chrome_content_renderer_client.cc         | 24 +++++++++++
+ .../canvas2d/base_rendering_context_2d.cc     | 25 +++++++++++
+ .../webgl/webgl_rendering_context_base.cc     | 11 +++++
+ .../platform/fingerprint/fingerprint_state.cc | 42 +++++++++++++++++++
+ .../platform/fingerprint/fingerprint_state.h  | 11 +++++
+ 10 files changed, 188 insertions(+)
+
+diff --git a/chrome/browser/chrome_content_browser_client.cc b/chrome/browser/chrome_content_browser_client.cc
+index f823433796c5c..8ba037c460f39 100644
+--- a/chrome/browser/chrome_content_browser_client.cc
++++ b/chrome/browser/chrome_content_browser_client.cc
+@@ -625,6 +625,7 @@
+ #if BUILDFLAG(ENABLE_EXTENSIONS_CORE)
+ #include "chrome/browser/extensions/chrome_content_browser_client_extensions_part.h"
+ #include "chrome/browser/extensions/chrome_extension_cookies.h"
++#include "chrome/browser/fingerprint/fingerprint_profile.h"
+ #include "extensions/browser/api/web_request/web_request_api.h"
+ #include "extensions/browser/extension_protocols.h"
+ #include "extensions/browser/extension_registry.h"
+@@ -2799,6 +2800,29 @@ void ChromeContentBrowserClient::AppendExtraCommandLineSwitches(
+     base::CommandLine* command_line,
+     int child_process_id) {
+   crash_keys::AppendStringAnnotationsCommandLineSwitch(command_line);
++
++  // Chronium: propagate the fingerprint seed + WebGL string overrides to
++  // every child process so blink-side patches have everything available
++  // synchronously from the first frame.
++  {
++    auto* fp = chronium::FingerprintProfile::GetInstance();
++    if (fp->IsLoaded()) {
++      const auto& seed = fp->Seed();
++      command_line->AppendSwitchASCII(
++          switches::kFingerprintSeedHex,
++          base::HexEncode(base::span<const uint8_t>(seed)));
++      const std::string webgl_vendor = fp->WebGLUnmaskedVendor();
++      if (!webgl_vendor.empty()) {
++        command_line->AppendSwitchASCII(switches::kFingerprintWebGLVendor,
++                                        webgl_vendor);
++      }
++      const std::string webgl_renderer = fp->WebGLUnmaskedRenderer();
++      if (!webgl_renderer.empty()) {
++        command_line->AppendSwitchASCII(switches::kFingerprintWebGLRenderer,
++                                        webgl_renderer);
++      }
++    }
++  }
+ #if BUILDFLAG(IS_MAC)
+   std::unique_ptr<metrics::ClientInfo> client_info =
+       GoogleUpdateSettings::LoadMetricsClientInfo();
+diff --git a/chrome/browser/fingerprint/fingerprint_profile.cc b/chrome/browser/fingerprint/fingerprint_profile.cc
+index 56a64ade2b5eb..43f44f8f71b2a 100644
+--- a/chrome/browser/fingerprint/fingerprint_profile.cc
++++ b/chrome/browser/fingerprint/fingerprint_profile.cc
+@@ -64,6 +64,30 @@ void FingerprintProfile::GetConfig(GetConfigCallback callback) {
+   std::move(callback).Run(std::move(config));
+ }
+ 
++std::string FingerprintProfile::WebGLUnmaskedVendor() const {
++  if (!loaded_) {
++    return {};
++  }
++  const base::DictValue* webgl = dict_.FindDict("webgl");
++  if (!webgl) {
++    return {};
++  }
++  const std::string* s = webgl->FindString("unmasked_vendor");
++  return s ? *s : std::string();
++}
++
++std::string FingerprintProfile::WebGLUnmaskedRenderer() const {
++  if (!loaded_) {
++    return {};
++  }
++  const base::DictValue* webgl = dict_.FindDict("webgl");
++  if (!webgl) {
++    return {};
++  }
++  const std::string* s = webgl->FindString("unmasked_renderer");
++  return s ? *s : std::string();
++}
++
+ bool FingerprintProfile::LoadFromFile(const base::FilePath& path) {
+   std::string contents;
+   if (!base::ReadFileToString(path, &contents)) {
+diff --git a/chrome/browser/fingerprint/fingerprint_profile.h b/chrome/browser/fingerprint/fingerprint_profile.h
+index 3ff3f5e1cd2fe..eef348904783c 100644
+--- a/chrome/browser/fingerprint/fingerprint_profile.h
++++ b/chrome/browser/fingerprint/fingerprint_profile.h
+@@ -13,6 +13,7 @@
+ 
+ #include <array>
+ #include <cstdint>
++#include <string>
+ 
+ #include "base/files/file_path.h"
+ #include "base/no_destructor.h"
+@@ -63,6 +64,11 @@ class FingerprintProfile : public chrome::mojom::FingerprintConfigProvider {
+     return loaded_ ? &dict_ : nullptr;
+   }
+ 
++  // WebGL UNMASKED_VENDOR_WEBGL / UNMASKED_RENDERER_WEBGL spoofs. Empty
++  // strings mean "no override".
++  std::string WebGLUnmaskedVendor() const;
++  std::string WebGLUnmaskedRenderer() const;
++
+  private:
+   friend class base::NoDestructor<FingerprintProfile>;
+   FingerprintProfile();
+diff --git a/chrome/common/chrome_switches.cc b/chrome/common/chrome_switches.cc
+index 40aa27fe711f5..0ee803d9014a9 100644
+--- a/chrome/common/chrome_switches.cc
++++ b/chrome/common/chrome_switches.cc
+@@ -350,6 +350,14 @@ const char kForceWhatsNew[] = "force-whats-new";
+ // Loaded once at startup by chronium::FingerprintProfile::LoadFromFile().
+ const char kFingerprintProfile[] = "fingerprint-profile";
+ 
++// Chronium (internal): 64-char hex seed propagated from browser to renderers.
++const char kFingerprintSeedHex[] = "fingerprint-seed-hex";
++
++// Chronium (internal): WebGL spoofed strings propagated from browser to
++// renderers.
++const char kFingerprintWebGLVendor[] = "fingerprint-webgl-vendor";
++const char kFingerprintWebGLRenderer[] = "fingerprint-webgl-renderer";
++
+ // Does not show the crash restore bubble when the browser is started during the
+ // system startup phase in ChromeOS, if the ChromeOS full restore feature is
+ // enabled, because the ChromeOS full restore notification is shown for the user
+diff --git a/chrome/common/chrome_switches.h b/chrome/common/chrome_switches.h
+index 78b10315d7970..a610f27250215 100644
+--- a/chrome/common/chrome_switches.h
++++ b/chrome/common/chrome_switches.h
+@@ -126,6 +126,19 @@ extern const char kForceWhatsNew[];
+ // Chronium: path to a per-profile fingerprint JSON config file.
+ extern const char kFingerprintProfile[];
+ 
++// Chronium (internal): 64-char hex seed propagated from browser to child
++// processes so blink-side patches can apply noise synchronously from the
++// first frame, without waiting on an async Mojo roundtrip. Browser sets
++// this in AppendExtraCommandLineSwitches when a fingerprint profile is
++// loaded.
++extern const char kFingerprintSeedHex[];
++
++// Chronium (internal): per-profile spoofed WebGL UNMASKED_VENDOR_WEBGL
++// (37445) and UNMASKED_RENDERER_WEBGL (37446) strings, propagated from
++// browser to renderers.
++extern const char kFingerprintWebGLVendor[];
++extern const char kFingerprintWebGLRenderer[];
++
+ extern const char kHideCrashRestoreBubble[];
+ extern const char kHomePage[];
+ #if !BUILDFLAG(IS_ANDROID)
+diff --git a/chrome/renderer/chrome_content_renderer_client.cc b/chrome/renderer/chrome_content_renderer_client.cc
+index 347d6c4d50612..351c491de17e1 100644
+--- a/chrome/renderer/chrome_content_renderer_client.cc
++++ b/chrome/renderer/chrome_content_renderer_client.cc
+@@ -38,6 +38,7 @@
+ #include "chrome/common/chrome_isolated_world_ids.h"
+ #include "chrome/common/chrome_paths.h"
+ #include "chrome/common/chrome_switches.h"
++#include "third_party/blink/renderer/platform/fingerprint/fingerprint_state.h"
+ #include "chrome/common/crash_keys.h"
+ #include "chrome/common/profiler/chrome_thread_group_profiler_client.h"
+ #include "chrome/common/profiler/chrome_thread_profiler_client.h"
+@@ -381,6 +382,29 @@ ChromeContentRendererClient::~ChromeContentRendererClient() = default;
+ void ChromeContentRendererClient::RenderThreadStarted() {
+   RenderThread* thread = RenderThread::Get();
+ 
++  // Chronium: install the fingerprint state before any document or
++  // script runs. Values are propagated by the browser via
++  // ChromeContentBrowserClient::AppendExtraCommandLineSwitches.
++  {
++    const base::CommandLine* cmd_line =
++        base::CommandLine::ForCurrentProcess();
++    if (cmd_line->HasSwitch(switches::kFingerprintSeedHex)) {
++      const std::string hex =
++          cmd_line->GetSwitchValueASCII(switches::kFingerprintSeedHex);
++      std::vector<uint8_t> bytes;
++      if (base::HexStringToBytes(hex, &bytes) && bytes.size() == 32) {
++        blink::FingerprintState::Set(bytes.data());
++      }
++    }
++    const std::string webgl_vendor =
++        cmd_line->GetSwitchValueASCII(switches::kFingerprintWebGLVendor);
++    const std::string webgl_renderer =
++        cmd_line->GetSwitchValueASCII(switches::kFingerprintWebGLRenderer);
++    if (!webgl_vendor.empty() || !webgl_renderer.empty()) {
++      blink::FingerprintState::SetWebGLStrings(webgl_vendor, webgl_renderer);
++    }
++  }
++
+   main_thread_profiler_->SetAuxUnwinderFactory(base::BindRepeating(
+       &CreateV8Unwinder, base::Unretained(v8::Isolate::GetCurrent())));
+ 
+diff --git a/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc b/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
+index 381f92b90579f..86c5c36883113 100644
+--- a/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
++++ b/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
+@@ -86,6 +86,7 @@
+ #include "third_party/blink/renderer/platform/graphics/image_data_buffer.h"
+ #include "third_party/blink/renderer/platform/graphics/paint/paint_image.h"
+ #include "third_party/blink/renderer/platform/graphics/skia/skia_utils.h"
++#include "third_party/blink/renderer/platform/fingerprint/fingerprint_state.h"
+ #include "third_party/blink/renderer/platform/graphics/static_bitmap_image.h"
+ #include "third_party/blink/renderer/platform/graphics/video_frame_image_util.h"
+ #include "third_party/blink/renderer/platform/heap/garbage_collected.h"
+@@ -531,6 +532,30 @@ ImageData* BaseRenderingContext2D::getImageDataInternal(
+       SkIRect bounds =
+           snapshot->PaintImageForCurrentFrame().GetSkImageInfo().bounds();
+       DCHECK(!bounds.intersect(SkIRect::MakeXYWH(sx, sy, sw, sh)));
++    } else if (FingerprintState::IsActive() &&
++               image_data_pixmap.info().bytesPerPixel() == 4 &&
++               image_data_pixmap.writable_addr() != nullptr) {
++      // Chronium: per-profile seeded noise on the returned pixel buffer.
++      // Uses canvas-space coordinates (sx+x, sy+y) and the same "canvas"
++      // channel as toDataURL/toBlob so the same pixel is flipped
++      // consistently across all readback paths within a profile.
++      uint8_t* const base =
++          static_cast<uint8_t*>(image_data_pixmap.writable_addr());
++      const size_t row_bytes = image_data_pixmap.rowBytes();
++      const int width = image_data_pixmap.width();
++      const int height = image_data_pixmap.height();
++      for (int y = 0; y < height; ++y) {
++        uint8_t* row = base + static_cast<size_t>(y) * row_bytes;
++        for (int x = 0; x < width; ++x) {
++          const uint32_t hash = FingerprintState::HashAt(
++              "canvas", static_cast<uint32_t>(sx + x),
++              static_cast<uint32_t>(sy + y));
++          if ((hash & 0xFFu) == 0u) {
++            const uint32_t which = (hash >> 8) % 3u;
++            row[static_cast<size_t>(x) * 4u + which] ^= 1u;
++          }
++        }
++      }
+     }
+   }
+ 
+diff --git a/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc b/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
+index e3f40494b329d..c7a6fbbe8ffc5 100644
+--- a/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
++++ b/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
+@@ -127,6 +127,7 @@
+ #include "third_party/blink/renderer/modules/xr/xr_system.h"
+ #include "third_party/blink/renderer/platform/bindings/exception_state.h"
+ #include "third_party/blink/renderer/platform/bindings/script_state.h"
++#include "third_party/blink/renderer/platform/fingerprint/fingerprint_state.h"
+ #include "third_party/blink/renderer/platform/graphics/accelerated_static_bitmap_image.h"
+ #include "third_party/blink/renderer/platform/graphics/canvas_non2d_snapshot_provider_bitmap.h"
+ #include "third_party/blink/renderer/platform/graphics/canvas_resource.h"
+@@ -3997,6 +3998,11 @@ ScriptValue WebGLRenderingContextBase::getParameter(ScriptState* script_state,
+       return ScriptValue::CreateNull(script_state->GetIsolate());
+     case WebGLDebugRendererInfo::kUnmaskedRendererWebgl:
+       if (ExtensionEnabled(kWebGLDebugRendererInfoName)) {
++        // Chronium: per-profile spoof.
++        std::string_view spoof = FingerprintState::WebGLUnmaskedRenderer();
++        if (!spoof.empty()) {
++          return WebGLAny(script_state, String(spoof));
++        }
+         return WebGLAny(script_state,
+                         String(ContextGL()->GetString(GL_RENDERER)));
+       }
+@@ -4006,6 +4012,11 @@ ScriptValue WebGLRenderingContextBase::getParameter(ScriptState* script_state,
+       return ScriptValue::CreateNull(script_state->GetIsolate());
+     case WebGLDebugRendererInfo::kUnmaskedVendorWebgl:
+       if (ExtensionEnabled(kWebGLDebugRendererInfoName)) {
++        // Chronium: per-profile spoof.
++        std::string_view spoof = FingerprintState::WebGLUnmaskedVendor();
++        if (!spoof.empty()) {
++          return WebGLAny(script_state, String(spoof));
++        }
+         return WebGLAny(script_state,
+                         String(ContextGL()->GetString(GL_VENDOR)));
+       }
+diff --git a/third_party/blink/renderer/platform/fingerprint/fingerprint_state.cc b/third_party/blink/renderer/platform/fingerprint/fingerprint_state.cc
+index 0bb61f9339b23..40299adcc9b83 100644
+--- a/third_party/blink/renderer/platform/fingerprint/fingerprint_state.cc
++++ b/third_party/blink/renderer/platform/fingerprint/fingerprint_state.cc
+@@ -6,6 +6,8 @@
+ #include <atomic>
+ #include <cstring>
+ 
++#include "base/no_destructor.h"
++
+ namespace blink {
+ 
+ namespace {
+@@ -18,6 +20,19 @@ namespace {
+ std::array<uint8_t, 32> g_seed{};
+ std::atomic<bool> g_active{false};
+ 
++// WebGL string overrides. base::NoDestructor avoids the
++// -Wexit-time-destructors error Chromium enforces on plain static
++// std::string. First-setter wins, controlled by g_webgl_set.
++std::string& WebGLVendorStorage() {
++  static base::NoDestructor<std::string> s;
++  return *s;
++}
++std::string& WebGLRendererStorage() {
++  static base::NoDestructor<std::string> s;
++  return *s;
++}
++std::atomic<bool> g_webgl_set{false};
++
+ // xxHash-style scalar mix. Cryptographically weak but plenty good for
+ // distinguishing fingerprints. Deterministic for the same (seed, channel,
+ // x, y) tuple.
+@@ -65,11 +80,38 @@ void FingerprintState::Set(const uint8_t* seed_32) {
+   g_active.store(true, std::memory_order_release);
+ }
+ 
++// static
++void FingerprintState::SetWebGLStrings(std::string_view unmasked_vendor,
++                                       std::string_view unmasked_renderer) {
++  if (g_webgl_set.load(std::memory_order_acquire)) {
++    return;
++  }
++  WebGLVendorStorage().assign(unmasked_vendor);
++  WebGLRendererStorage().assign(unmasked_renderer);
++  g_webgl_set.store(true, std::memory_order_release);
++}
++
+ // static
+ bool FingerprintState::IsActive() {
+   return g_active.load(std::memory_order_acquire);
+ }
+ 
++// static
++std::string_view FingerprintState::WebGLUnmaskedVendor() {
++  if (!g_webgl_set.load(std::memory_order_acquire)) {
++    return {};
++  }
++  return WebGLVendorStorage();
++}
++
++// static
++std::string_view FingerprintState::WebGLUnmaskedRenderer() {
++  if (!g_webgl_set.load(std::memory_order_acquire)) {
++    return {};
++  }
++  return WebGLRendererStorage();
++}
++
+ // static
+ uint32_t FingerprintState::HashAt(std::string_view channel,
+                                   uint32_t x,
+diff --git a/third_party/blink/renderer/platform/fingerprint/fingerprint_state.h b/third_party/blink/renderer/platform/fingerprint/fingerprint_state.h
+index 1f020bcc83441..bcf852d88dce6 100644
+--- a/third_party/blink/renderer/platform/fingerprint/fingerprint_state.h
++++ b/third_party/blink/renderer/platform/fingerprint/fingerprint_state.h
+@@ -17,6 +17,7 @@
+ 
+ #include <array>
+ #include <cstdint>
++#include <string>
+ #include <string_view>
+ 
+ #include "third_party/blink/renderer/platform/platform_export.h"
+@@ -30,10 +31,20 @@ class PLATFORM_EXPORT FingerprintState {
+   // |seed| must point to 32 bytes.
+   static void Set(const uint8_t* seed_32);
+ 
++  // Sets the WebGL UNMASKED_VENDOR_WEBGL / UNMASKED_RENDERER_WEBGL
++  // strings returned by webgl getParameter. Empty strings mean "no
++  // override" — keep the real driver value. First setter wins.
++  static void SetWebGLStrings(std::string_view unmasked_vendor,
++                              std::string_view unmasked_renderer);
++
+   // True when a non-zero seed has been Set(). Fingerprint patches MUST
+   // check this and fall back to default behavior when false.
+   static bool IsActive();
+ 
++  // Empty when no override is in effect.
++  static std::string_view WebGLUnmaskedVendor();
++  static std::string_view WebGLUnmaskedRenderer();
++
+   // Deterministic 32-bit hash of (process seed, channel, x, y).
+   // |channel| should be a short stable string identifying the fingerprint
+   // surface, e.g. "canvas", "webgl-readpixels", "audio".
+-- 
+2.54.0.windows.1
+

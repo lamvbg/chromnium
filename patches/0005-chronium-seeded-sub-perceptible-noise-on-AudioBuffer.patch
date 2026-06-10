@@ -1,0 +1,194 @@
+From 9b7e64091b9fa9d65f0e677ab349bb20f9e8c6e9 Mon Sep 17 00:00:00 2001
+From: Chronium Build <chronium@interlink.local>
+Date: Fri, 5 Jun 2026 17:34:03 +0700
+Subject: [PATCH 05/14] chronium: seeded sub-perceptible noise on AudioBuffer +
+ AnalyserNode
+
+Patches the two main audio fingerprint readback surfaces so that
+OfflineAudioContext + dynamicsCompressor probes (the classic
+fingerprintjs2 audio test) produce per-profile-deterministic but
+cross-profile-divergent output.
+
+AudioBuffer::getChannelData(unsigned, ExceptionState&)
+  Multiplies each sample by 1 +/- (~1e-5 * seeded signed unit).
+  Magnitude ~-100 dB, inaudible, but above float32's ~1.2e-7
+  relative epsilon so the change survives the float multiply.
+  Applied at most once per channel via noised_channel_mask_.
+
+  KEY DESIGN POINT: the hook is on the JS-facing (unsigned,
+  ExceptionState&) overload, NOT the internal (unsigned) one.
+  SharedAudioBuffer's constructor calls the internal overload
+  during OfflineAudioContext setup, *before* the audio render
+  thread fills the buffer. Noising there gets overwritten by
+  rendering. JS only ever sees the buffer via the
+  (unsigned, ExceptionState&) entry, by which time rendering is
+  done and the noise persists.
+
+AnalyserNode::get{Float,Byte}{Frequency,TimeDomain}Data
+  Adds 1e-4 dB-scale perturbation on float buffers and 1/256 LSB
+  flip on byte buffers, deterministic per (profile, index). Each
+  call gets perturbed identically within a profile, distinctly
+  across profiles.
+
+Verified on OfflineAudioContext+DynamicsCompressor test:
+  baseline (no profile): sum 124.458847878906, s[4500] 0.390683501959
+  profile A: sum 124.458802962399, s[4500] 0.390685975552
+  profile B: sum 124.458842002932, s[4500] 0.390680104494
+
+Files touched:
+- third_party/blink/renderer/modules/webaudio/audio_buffer.{h,cc}
+- third_party/blink/renderer/modules/webaudio/analyser_node.cc
+---
+ .../modules/webaudio/analyser_node.cc         | 47 +++++++++++++++++++
+ .../renderer/modules/webaudio/audio_buffer.cc | 30 ++++++++++++
+ .../renderer/modules/webaudio/audio_buffer.h  |  5 ++
+ 3 files changed, 82 insertions(+)
+
+diff --git a/third_party/blink/renderer/modules/webaudio/analyser_node.cc b/third_party/blink/renderer/modules/webaudio/analyser_node.cc
+index 688a2fec77ee2..2e76b54279d69 100644
+--- a/third_party/blink/renderer/modules/webaudio/analyser_node.cc
++++ b/third_party/blink/renderer/modules/webaudio/analyser_node.cc
+@@ -29,6 +29,7 @@
+ #include "third_party/blink/renderer/modules/webaudio/analyser_handler.h"
+ #include "third_party/blink/renderer/modules/webaudio/audio_graph_tracer.h"
+ #include "third_party/blink/renderer/modules/webaudio/base_audio_context.h"
++#include "third_party/blink/renderer/platform/fingerprint/fingerprint_state.h"
+ 
+ namespace blink {
+ 
+@@ -116,22 +117,68 @@ double AnalyserNode::smoothingTimeConstant() const {
+   return GetAnalyserHandler().SmoothingTimeConstant();
+ }
+ 
++// Chronium: applies seeded sub-perceptible noise to the user-supplied
++// AnalyserNode output buffer. The buffer is written by the analyser
++// handler then perturbed here, so every call sees a perturbed value but
++// the perturbation is deterministic per (profile, channel, index).
++namespace {
++
++void NoiseFloatBuffer(DOMFloat32Array* array, const char* channel_name) {
++  if (!array || !FingerprintState::IsActive()) {
++    return;
++  }
++  float* data = array->Data();
++  const unsigned len = array->length();
++  for (unsigned i = 0; i < len; ++i) {
++    const uint32_t hash = FingerprintState::HashAt(channel_name, 0u, i);
++    const float signed_unit =
++        (static_cast<float>(hash) * (1.0f / 2147483648.0f)) - 1.0f;
++    // Frequency data is in dB (typically -100..0). A 1e-4 perturbation
++    // shifts the hash without crossing rounding/quantization boundaries
++    // a fingerprinter would expect to be stable across runs of the same
++    // profile.
++    data[i] += signed_unit * 1e-4f;
++  }
++}
++
++void NoiseByteBuffer(DOMUint8Array* array, const char* channel_name) {
++  if (!array || !FingerprintState::IsActive()) {
++    return;
++  }
++  uint8_t* data = array->Data();
++  const unsigned len = array->length();
++  for (unsigned i = 0; i < len; ++i) {
++    const uint32_t hash = FingerprintState::HashAt(channel_name, 0u, i);
++    // Flip LSB of ~1/256 entries; keeps the buffer visually identical for
++    // any reasonable consumer but changes the fingerprint hash.
++    if ((hash & 0xFFu) == 0u) {
++      data[i] ^= 1u;
++    }
++  }
++}
++
++}  // namespace
++
+ void AnalyserNode::getFloatFrequencyData(NotShared<DOMFloat32Array> array) {
+   GetAnalyserHandler().GetFloatFrequencyData(array.Get(),
+                                              context()->currentTime());
++  NoiseFloatBuffer(array.Get(), "audio-freq-f");
+ }
+ 
+ void AnalyserNode::getByteFrequencyData(NotShared<DOMUint8Array> array) {
+   GetAnalyserHandler().GetByteFrequencyData(array.Get(),
+                                             context()->currentTime());
++  NoiseByteBuffer(array.Get(), "audio-freq-b");
+ }
+ 
+ void AnalyserNode::getFloatTimeDomainData(NotShared<DOMFloat32Array> array) {
+   GetAnalyserHandler().GetFloatTimeDomainData(array.Get());
++  NoiseFloatBuffer(array.Get(), "audio-time-f");
+ }
+ 
+ void AnalyserNode::getByteTimeDomainData(NotShared<DOMUint8Array> array) {
+   GetAnalyserHandler().GetByteTimeDomainData(array.Get());
++  NoiseByteBuffer(array.Get(), "audio-time-b");
+ }
+ 
+ void AnalyserNode::ReportDidCreate() {
+diff --git a/third_party/blink/renderer/modules/webaudio/audio_buffer.cc b/third_party/blink/renderer/modules/webaudio/audio_buffer.cc
+index 7084a5303edc0..961f24ee42099 100644
+--- a/third_party/blink/renderer/modules/webaudio/audio_buffer.cc
++++ b/third_party/blink/renderer/modules/webaudio/audio_buffer.cc
+@@ -38,6 +38,7 @@
+ #include "third_party/blink/renderer/platform/audio/audio_utilities.h"
+ #include "third_party/blink/renderer/platform/bindings/exception_messages.h"
+ #include "third_party/blink/renderer/platform/bindings/exception_state.h"
++#include "third_party/blink/renderer/platform/fingerprint/fingerprint_state.h"
+ #include "third_party/blink/renderer/platform/wtf/text/strcat.h"
+ 
+ namespace blink {
+@@ -209,6 +210,35 @@ NotShared<DOMFloat32Array> AudioBuffer::getChannelData(
+     return NotShared<DOMFloat32Array>(nullptr);
+   }
+ 
++  // Chronium: apply seeded sub-perceptible noise on the FIRST JS-facing
++  // read of each channel. We hook the (unsigned, ExceptionState&) entry
++  // point — not the internal (unsigned) one — because internal C++ paths
++  // (e.g. SharedAudioBuffer ctor) call this *before* the audio render
++  // thread has written into the buffer; noising there would be overwritten.
++  // By the time JS observes the buffer, rendering is complete and this
++  // hook is the right place.
++  if (FingerprintState::IsActive() && channel_index < 32u) {
++    const uint32_t bit = 1u << channel_index;
++    if ((noised_channel_mask_ & bit) == 0u) {
++      DOMFloat32Array* arr = channels_[channel_index].Get();
++      if (arr) {
++        float* data = arr->Data();
++        const unsigned len = arr->length();
++        for (unsigned i = 0; i < len; ++i) {
++          const uint32_t hash =
++              FingerprintState::HashAt("audio", channel_index, i);
++          // Signed unit in roughly [-1, +1]; scale by 1e-5 (~-100 dB,
++          // inaudible) which is above float32's ~1.2e-7 relative epsilon
++          // so the change survives the multiply.
++          const float signed_unit =
++              (static_cast<float>(hash) * (1.0f / 2147483648.0f)) - 1.0f;
++          data[i] *= 1.0f + signed_unit * 1e-5f;
++        }
++        noised_channel_mask_ |= bit;
++      }
++    }
++  }
++
+   return getChannelData(channel_index);
+ }
+ 
+diff --git a/third_party/blink/renderer/modules/webaudio/audio_buffer.h b/third_party/blink/renderer/modules/webaudio/audio_buffer.h
+index 2e798e3e5bae7..b65558ed17788 100644
+--- a/third_party/blink/renderer/modules/webaudio/audio_buffer.h
++++ b/third_party/blink/renderer/modules/webaudio/audio_buffer.h
+@@ -127,6 +127,11 @@ class MODULES_EXPORT AudioBuffer final : public ScriptWrappable {
+   uint32_t length_;
+ 
+   HeapVector<Member<DOMFloat32Array>> channels_;
++
++  // Chronium: bitmask of channels that have already had fingerprint noise
++  // applied. Ensures the multiplier is applied at most once per channel
++  // so repeated getChannelData reads return a stable buffer.
++  uint32_t noised_channel_mask_ = 0;
+ };
+ 
+ // Shared data that audio threads can hold onto.
+-- 
+2.54.0.windows.1
+

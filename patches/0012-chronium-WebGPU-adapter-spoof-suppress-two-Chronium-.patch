@@ -1,0 +1,162 @@
+From b1ddb3e9c43c87e9cbc042a32c0d619ff213fa1d Mon Sep 17 00:00:00 2001
+From: Chronium Build <chronium@interlink.local>
+Date: Mon, 8 Jun 2026 11:20:47 +0700
+Subject: [PATCH 12/14] chronium: WebGPU adapter spoof + suppress two
+ Chronium-only infobars
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Two unrelated cleanup items in one patch.
+
+WebGPU adapter info (plan §5 #11)
+  GPUAdapterInfo.vendor and .description now return the WebGL
+  UNMASKED_VENDOR_WEBGL / UNMASKED_RENDERER_WEBGL spoofs from the
+  active profile, mirroring the WebGL spoof from patch 0004.
+  Hooked at construction time so the cached fields stay consistent
+  with what JS sees through repeated property reads; const String&
+  return type of the getters is preserved.
+
+  .architecture, .device, .driver, .backend and the d3d/vk version
+  fields are left at the platform default — modern Chrome already
+  returns empty strings for these in the privacy-default path, and
+  fingerprinters mainly key on vendor + description.
+
+  Verified:
+    profile A: vendor 'NVIDIA Corporation', description
+               'NVIDIA GeForce RTX 3060/PCIe/SSE2'
+    profile B: vendor 'Intel Inc.', description
+               'Intel(R) UHD Graphics 630'
+
+Infobar suppression (plan §5 #19, partial)
+  infobar_utils.cc: skip GoogleApiKeysInfoBarDelegate when a
+  fingerprint profile is loaded. We deliberately ship without
+  Google API keys (use_official_google_api_keys=false in args.gn);
+  the 'Google API keys are missing. Some functionality of Chromium
+  will be disabled.' banner is just user-visible noise that also
+  leaks 'this build has no Google blessing' on every screenshot.
+
+  startup_launch_manager.cc: ShouldShowInfoBars returns false when
+  a fingerprint profile is loaded. The 'Chromium now launches when
+  Windows starts so you can begin browsing instantly' opt-out
+  prompt makes no sense for the anti-detect workflow, where every
+  session uses a throwaway --user-data-dir and a launch-on-login
+  setting would be both meaningless and pollutes screenshots / logs.
+
+Files touched:
+- third_party/blink/renderer/modules/webgpu/gpu_adapter_info.cc
+- chrome/browser/ui/startup/infobar_utils.cc
+- chrome/browser/startup/startup_launch_manager.cc
+---
+ .../browser/startup/startup_launch_manager.cc |  9 ++++++++
+ chrome/browser/ui/startup/infobar_utils.cc    |  9 +++++++-
+ .../modules/webgpu/gpu_adapter_info.cc        | 22 +++++++++++++++++--
+ 3 files changed, 37 insertions(+), 3 deletions(-)
+
+diff --git a/chrome/browser/startup/startup_launch_manager.cc b/chrome/browser/startup/startup_launch_manager.cc
+index 1c102e732b3ae..38a4f8e0c3f23 100644
+--- a/chrome/browser/startup/startup_launch_manager.cc
++++ b/chrome/browser/startup/startup_launch_manager.cc
+@@ -14,6 +14,7 @@
+ #include "base/task/thread_pool.h"
+ #include "base/time/time.h"
+ #include "base/timer/timer.h"
++#include "chrome/browser/fingerprint/fingerprint_profile.h"
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/startup/startup_features.h"
+ #include "chrome/common/chrome_switches.h"
+@@ -49,6 +50,14 @@ UpdatePrefAndGetInfoBarType(PrefService* local_state) {
+ }
+ 
+ bool ShouldShowInfoBars() {
++  // Chronium: suppress the "launches when Windows starts" infobar when
++  // a fingerprint profile is loaded. Anti-detect users run with a
++  // throwaway --user-data-dir per session and don't want the boot-launch
++  // dialog at all (also makes screenshots / logging cleaner).
++  if (chronium::FingerprintProfile::GetInstance()->IsLoaded()) {
++    return false;
++  }
++
+   constexpr int kMaxPromptCount = 5;
+   constexpr int kRepromptDurationDays = 21;
+ 
+diff --git a/chrome/browser/ui/startup/infobar_utils.cc b/chrome/browser/ui/startup/infobar_utils.cc
+index 505e8669edbbf..15275181e6aed 100644
+--- a/chrome/browser/ui/startup/infobar_utils.cc
++++ b/chrome/browser/ui/startup/infobar_utils.cc
+@@ -10,6 +10,7 @@
+ #include "build/branding_buildflags.h"
+ #include "build/buildflag.h"
+ #include "chrome/browser/browser_process.h"
++#include "chrome/browser/fingerprint/fingerprint_profile.h"
+ #include "chrome/browser/obsolete_system/obsolete_system.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/ui/browser.h"
+@@ -184,7 +185,13 @@ void AddInfoBarsIfNecessary(BrowserWindowInterface* browser,
+   infobars::ContentInfoBarManager* infobar_manager =
+       infobars::ContentInfoBarManager::FromWebContents(web_contents);
+ 
+-  if (!google_apis::HasAPIKeyConfigured()) {
++  // Chronium: suppress the "Google API keys are missing" banner when a
++  // fingerprint profile is loaded. We intentionally ship without Google
++  // API keys (args.gn: use_official_google_api_keys=false); the banner is
++  // user-visible noise that also leaks "this build was made without
++  // Google's blessing" to anyone reading the screen.
++  if (!chronium::FingerprintProfile::GetInstance()->IsLoaded() &&
++      !google_apis::HasAPIKeyConfigured()) {
+     GoogleApiKeysInfoBarDelegate::Create(infobar_manager);
+   }
+ 
+diff --git a/third_party/blink/renderer/modules/webgpu/gpu_adapter_info.cc b/third_party/blink/renderer/modules/webgpu/gpu_adapter_info.cc
+index 9d155705c1350..d7b6255af062d 100644
+--- a/third_party/blink/renderer/modules/webgpu/gpu_adapter_info.cc
++++ b/third_party/blink/renderer/modules/webgpu/gpu_adapter_info.cc
+@@ -4,11 +4,28 @@
+ 
+ #include "third_party/blink/renderer/modules/webgpu/gpu_adapter_info.h"
+ 
++#include "base/containers/span.h"
+ #include "third_party/blink/renderer/modules/webgpu/gpu_memory_heap_info.h"
+ #include "third_party/blink/renderer/modules/webgpu/gpu_subgroup_matrix_config.h"
++#include "third_party/blink/renderer/platform/fingerprint/fingerprint_state.h"
+ 
+ namespace blink {
+ 
++namespace {
++
++// Chronium: returns the per-profile spoof when FingerprintState is active,
++// otherwise the platform-reported |real| value. Applied at construction
++// time so the cached fields are stable for the lifetime of the object and
++// the getters keep returning a reference to a member.
++String SpoofedOr(std::string_view spoof, const String& real) {
++  if (FingerprintState::IsActive() && !spoof.empty()) {
++    return String::FromUtf8(base::as_byte_span(spoof));
++  }
++  return real;
++}
++
++}  // namespace
++
+ GPUAdapterInfo::GPUAdapterInfo(const String& vendor,
+                                const String& architecture,
+                                uint32_t subgroup_min_size,
+@@ -22,13 +39,14 @@ GPUAdapterInfo::GPUAdapterInfo(const String& vendor,
+                                const std::optional<uint32_t> d3d_shader_model,
+                                const std::optional<uint32_t> vk_driver_version,
+                                const String& power_preference)
+-    : vendor_(vendor),
++    : vendor_(SpoofedOr(FingerprintState::WebGLUnmaskedVendor(), vendor)),
+       architecture_(architecture),
+       subgroup_min_size_(subgroup_min_size),
+       subgroup_max_size_(subgroup_max_size),
+       is_fallback_adapter_(is_fallback_adapter),
+       device_(device),
+-      description_(description),
++      description_(SpoofedOr(FingerprintState::WebGLUnmaskedRenderer(),
++                             description)),
+       driver_(driver),
+       backend_(backend),
+       type_(type),
+-- 
+2.54.0.windows.1
+

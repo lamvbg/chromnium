@@ -1,0 +1,162 @@
+From 801173658a98b87818c5a292ba728c302b8eeac5 Mon Sep 17 00:00:00 2001
+From: Chronium <chronium@interlink.local>
+Date: Mon, 8 Jun 2026 18:33:09 +0700
+Subject: [PATCH] chronium: route per-profile UA Client Hints through
+ embedder_support hook
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The patch-0013 ContentBrowserClient::GetUserAgentMetadata() override
+was a no-op for HTTP requests: the default ClientHintsControllerDelegate
+(components/client_hints/browser/client_hints.cc:153) short-circuits
+straight to embedder_support::GetUserAgentMetadata() without ever
+asking the browser client, so every Sec-CH-UA-* header on every
+navigation came out reporting the host OS (Windows, Chromium 148)
+instead of the profile (macOS, Chrome 130).
+
+Verified pre-fix on https://tls.peet.ws/api/all:
+  sec-ch-ua:           "Not/A)Brand";v="99", "Chromium";v="148"
+  sec-ch-ua-platform:  "Windows"
+  user-agent:          Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/130.0.0.0
+
+That UA-vs-platform mismatch is Cloudflare Bot Management's bread-and-
+butter signal: claim macOS in the UA string, advertise Windows in the
+client hints. Pass JA4 + Akamai + every JS fingerprint surface, still
+get challenged at grok.com because of two lines of header text.
+
+Fix: add a process-wide override slot inside
+components/embedder_support, populated once at browser startup
+(chrome_browser_main.cc PreCreateThreadsImpl, immediately after the
+fingerprint JSON loads) with FingerprintProfile::UserAgentMetadata().
+embedder_support::GetUserAgentMetadata() now returns the override
+when present, before any platform-detection code runs.
+
+Verified post-fix on the same test endpoint:
+  sec-ch-ua:           "Chromium";v="130", "Google Chrome";v="130", "Not?A_Brand";v="99"
+  sec-ch-ua-platform:  "macOS"
+  user-agent:          Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/130.0.0.0
+  (JA4 / Akamai / peetprint hashes still byte-match Chrome 149 stable)
+
+The override lives entirely inside embedder_support so renderer
+processes pick it up the same way browser does — navigator.userAgentData
+and getHighEntropyValues() observe the same Mac/Chrome 130 view as
+the network service does.
+---
+ chrome/browser/chrome_browser_main.cc         | 15 ++++++
+ .../embedder_support/user_agent_utils.cc      | 46 +++++++++++++++++++
+ .../embedder_support/user_agent_utils.h       |  7 +++
+ 3 files changed, 68 insertions(+)
+
+diff --git a/chrome/browser/chrome_browser_main.cc b/chrome/browser/chrome_browser_main.cc
+index 62d0efc258821..a59d9790d9547 100644
+--- a/chrome/browser/chrome_browser_main.cc
++++ b/chrome/browser/chrome_browser_main.cc
+@@ -42,6 +42,7 @@
+ #include "chrome/browser/first_run/bookmark_importer.h"
+ // IWYU pragma: keep — embedder_support/switches.h provides kUserAgent.
+ #include "components/embedder_support/switches.h"
++#include "components/embedder_support/user_agent_utils.h"
+ #include "chrome/browser/first_run/first_run_features.h"
+ #include "chrome/browser/gpu/chrome_browser_main_extra_parts_gpu.h"
+ #include "chrome/browser/language/url_language_histogram_factory.h"
+@@ -1228,6 +1229,20 @@ int ChromeBrowserMainParts::PreCreateThreadsImpl() {
+             !cmd_line->HasSwitch(embedder_support::kUserAgent)) {
+           cmd_line->AppendSwitchASCII(embedder_support::kUserAgent, ua);
+         }
++        // Chronium: install the per-profile UA Client Hints metadata into
++        // the embedder_support process-wide override. Every downstream
++        // caller (network service Sec-CH-UA-* header builder, renderer
++        // navigator.userAgentData, ClientHintsControllerDelegate default
++        // impl) reads from embedder_support::GetUserAgentMetadata(), so a
++        // single setter here propagates to all of them — the
++        // ChromeContentBrowserClient::GetUserAgentMetadata() override
++        // alone is not sufficient because the ClientHints delegate in
++        // components/client_hints/browser/client_hints.cc short-circuits
++        // straight to embedder_support and never asks the browser client.
++        if (auto metadata = fp->UserAgentMetadata()) {
++          embedder_support::SetChroniumUserAgentMetadataOverride(
++              std::move(*metadata));
++        }
+       }
+     }
+   }
+diff --git a/components/embedder_support/user_agent_utils.cc b/components/embedder_support/user_agent_utils.cc
+index 557eadb18229e..ef76932206b84 100644
+--- a/components/embedder_support/user_agent_utils.cc
++++ b/components/embedder_support/user_agent_utils.cc
+@@ -635,7 +635,53 @@ std::string GetPlatformForUAMetadata() {
+ #endif
+ }
+ 
++namespace {
++
++// Chronium: process-wide override installed by
++// SetChroniumUserAgentMetadataOverride() at startup. When set, every
++// caller of GetUserAgentMetadata() — including the network service's
++// Sec-CH-UA header generator and the renderer's navigator.userAgentData
++// — observes the profile-supplied values instead of the host OS defaults.
++// We can't bolt this onto ContentBrowserClient::GetUserAgentMetadata()
++// alone because the default ClientHintsControllerDelegate
++// (components/client_hints/browser/client_hints.cc::GetUserAgentMetadata)
++// short-circuits to embedder_support::GetUserAgentMetadata() without
++// going through the ContentBrowserClient hook.
++std::optional<blink::UserAgentMetadata>& ChroniumMetadataOverride() {
++  static base::NoDestructor<std::optional<blink::UserAgentMetadata>> v;
++  return *v;
++}
++
++}  // namespace
++
++void SetChroniumUserAgentMetadataOverride(blink::UserAgentMetadata metadata) {
++  auto& slot = ChroniumMetadataOverride();
++  if (slot.has_value()) {
++    return;  // First setter wins; never re-clobber.
++  }
++  slot = std::move(metadata);
++}
++
+ blink::UserAgentMetadata GetUserAgentMetadata(bool only_low_entropy_ch) {
++  // Chronium: per-profile override takes precedence over the platform's
++  // default brand/platform/architecture. only_low_entropy_ch is honored
++  // by dropping the high-entropy fields when requested.
++  if (const auto& override = ChroniumMetadataOverride();
++      override.has_value()) {
++    blink::UserAgentMetadata m = *override;
++    if (only_low_entropy_ch) {
++      m.brand_full_version_list.clear();
++      m.full_version.clear();
++      m.architecture.clear();
++      m.model.clear();
++      m.bitness.clear();
++      m.wow64 = false;
++      m.platform_version.clear();
++      m.form_factors.clear();
++    }
++    return m;
++  }
++
+   blink::UserAgentMetadata metadata;
+ 
+   // Low entropy client hints.
+diff --git a/components/embedder_support/user_agent_utils.h b/components/embedder_support/user_agent_utils.h
+index 39a9d069561c6..e7274410cb167 100644
+--- a/components/embedder_support/user_agent_utils.h
++++ b/components/embedder_support/user_agent_utils.h
+@@ -38,6 +38,13 @@ std::string GetUserAgent();
+ // populate the low entropy client hints.
+ blink::UserAgentMetadata GetUserAgentMetadata(bool only_low_entropy_ch = false);
+ 
++// Chronium: install a process-wide override returned by
++// GetUserAgentMetadata() for ALL callers (network service header
++// generation, renderer hint headers, etc). Called once during
++// ChromeBrowserMainParts::PreCreateThreadsImpl right after the
++// fingerprint profile JSON parses. First setter wins.
++void SetChroniumUserAgentMetadataOverride(blink::UserAgentMetadata metadata);
++
+ // Returns a list of form-factors compliant with
+ // https://wicg.github.io/ua-client-hints/#sec-ch-ua-form-factors.
+ std::vector<std::string> GetFormFactorsClientHint(
+-- 
+2.54.0.windows.1
+

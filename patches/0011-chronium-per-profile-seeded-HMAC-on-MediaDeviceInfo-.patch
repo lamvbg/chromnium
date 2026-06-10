@@ -1,0 +1,134 @@
+From 0d1d968040311c4d2bc9dbb9cdebb3c603a89a49 Mon Sep 17 00:00:00 2001
+From: Chronium Build <chronium@interlink.local>
+Date: Mon, 8 Jun 2026 10:08:17 +0700
+Subject: [PATCH 11/14] chronium: per-profile seeded HMAC on MediaDeviceInfo
+ deviceId/groupId
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Plan §5 #14 'Media devices'. Replaces the platform-reported deviceId
+and groupId fields returned by enumerateDevices() with 64-character
+lowercase hex strings deterministic from the fingerprint seed and the
+(device_kind, position) pair. The wire shape (length, hex charset)
+matches a real Chrome SHA256 device hash, so server-side parsers
+that only validate format remain happy.
+
+Properties (the point of the patch):
+- Same profile + same enumerate call -> identical id forever.
+- Same profile + same physical hardware -> identical id forever.
+- Different profile -> entirely unrelated id space, including for
+  the 'default' device that some platforms expose unauthenticated.
+- New hardware plugged in mid-session -> new (kind_idx, j) pair ->
+  new id, just like real Chrome (which derives from a salt + the
+  device's hardware id).
+
+Hook is in DevicesEnumerated, replacing String::FromUtf8 of the
+incoming device_id/group_id with ChroniumFingerprintMediaId for
+both the InputDeviceInfo (audio/video input) and MediaDeviceInfo
+(audio output) branches. We only rewrite when the platform reported
+a non-empty id: empty ids stay empty so the privacy default
+(unauthenticated 'default' audiooutput with empty ids) is preserved.
+That matches real Chrome behavior; a site that distinguishes
+authenticated vs unauthenticated state by empty-string check will
+still see the same shape from Chronium.
+
+Verification note: machines without a microphone / camera will
+return only the 'default audiooutput' entry with empty ids both
+before and after this patch (Chrome's privacy default; matches
+spec). To see the spoof in action, run on hardware that exposes
+non-empty device ids (either after getUserMedia consent or with
+real audio/video peripherals attached). On such a setup, the same
+profile across runs produces identical 64-char hex ids; two
+profiles produce two entirely disjoint id spaces.
+
+Files touched:
+- third_party/blink/renderer/modules/mediastream/media_devices.cc
+---
+ .../modules/mediastream/media_devices.cc      | 42 +++++++++++++++++--
+ 1 file changed, 38 insertions(+), 4 deletions(-)
+
+diff --git a/third_party/blink/renderer/modules/mediastream/media_devices.cc b/third_party/blink/renderer/modules/mediastream/media_devices.cc
+index 18855d9d71185..2054166d1e9f4 100644
+--- a/third_party/blink/renderer/modules/mediastream/media_devices.cc
++++ b/third_party/blink/renderer/modules/mediastream/media_devices.cc
+@@ -69,6 +69,7 @@
+ #include "third_party/blink/renderer/platform/scheduler/public/event_loop.h"
+ #include "third_party/blink/renderer/platform/weborigin/security_origin.h"
+ #include "third_party/blink/renderer/platform/wtf/functional.h"
++#include "third_party/blink/renderer/platform/fingerprint/fingerprint_state.h"
+ #include "third_party/blink/renderer/platform/wtf/text/string_builder.h"
+ 
+ namespace blink {
+@@ -91,6 +92,25 @@ void SendLogMessage(const std::string& message) {
+   blink::WebRtcLogMessage("MD::" + message);
+ }
+ 
++// Chronium: produces a 64-character lowercase hex string deterministic from
++// the fingerprint seed + (kind_idx, device_idx). Same profile, same
++// (kind, device) -> identical id forever; different profile -> entirely
++// different id. This is the §5 #14 "device IDs = HMAC(seed, real_device_id)"
++// pattern but seed-only (we ignore the real id so behavior is stable across
++// host hardware changes — a fingerprint property the user expects to outlast
++// docking stations being plugged in/out).
++String ChroniumFingerprintMediaId(const char* channel,
++                                  uint32_t kind_idx,
++                                  uint32_t device_idx) {
++  StringBuilder out;
++  for (uint32_t k = 0; k < 8u; ++k) {
++    const uint32_t h = FingerprintState::HashAt(
++        channel, kind_idx * 1024u + device_idx, k);
++    out.AppendFormat("%08x", h);
++  }
++  return out.ToString();
++}
++
+ void LogDevicesEnumerated(
+     ScriptPromiseResolverWithTracker<EnumerateDevicesResult,
+                                      IDLSequence<MediaDeviceInfo>>*
+@@ -1449,6 +1469,21 @@ void MediaDevices::DevicesEnumerated(
+           static_cast<mojom::blink::MediaDeviceType>(i);
+       WebMediaDeviceInfo device_info = enumeration[i][j];
+       String device_label = String::FromUtf8(device_info.label);
++      // Chronium: replace platform device + group ids with seeded hashes so
++      // device fingerprints survive a profile-clean-room cookie wipe but
++      // diverge between profiles. We rewrite, not append, so the wire shape
++      // (lengths, hex chars) still looks like a real Chrome device id.
++      String chronium_device_id =
++          String::FromUtf8(device_info.device_id);
++      String chronium_group_id = String::FromUtf8(device_info.group_id);
++      if (FingerprintState::IsActive() && !chronium_device_id.empty()) {
++        chronium_device_id =
++            ChroniumFingerprintMediaId("media-device-id", static_cast<uint32_t>(i),
++                                       static_cast<uint32_t>(j));
++        chronium_group_id =
++            ChroniumFingerprintMediaId("media-group-id", static_cast<uint32_t>(i),
++                                       static_cast<uint32_t>(j));
++      }
+       if (device_type == mojom::blink::MediaDeviceType::kMediaAudioInput ||
+           device_type == mojom::blink::MediaDeviceType::kMediaVideoInput) {
+         if (!device_info.device_id.empty()) {
+@@ -1456,8 +1491,8 @@ void MediaDevices::DevicesEnumerated(
+         }
+         InputDeviceInfo* input_device_info =
+             MakeGarbageCollected<InputDeviceInfo>(
+-                String::FromUtf8(device_info.device_id), device_label,
+-                String::FromUtf8(device_info.group_id), device_type);
++                chronium_device_id, device_label, chronium_group_id,
++                device_type);
+         if (device_type == mojom::blink::MediaDeviceType::kMediaVideoInput &&
+             !video_input_capabilities.empty()) {
+           input_device_info->SetVideoInputCapabilities(
+@@ -1471,8 +1506,7 @@ void MediaDevices::DevicesEnumerated(
+         media_devices.push_back(input_device_info);
+       } else {
+         media_devices.push_back(MakeGarbageCollected<MediaDeviceInfo>(
+-            String::FromUtf8(device_info.device_id), device_label,
+-            String::FromUtf8(device_info.group_id), device_type));
++            chronium_device_id, device_label, chronium_group_id, device_type));
+       }
+     }
+   }
+-- 
+2.54.0.windows.1
+

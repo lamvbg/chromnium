@@ -1,0 +1,343 @@
+From b5ddc35de515fc96ee5517c2e3d1f4022c1ddf8e Mon Sep 17 00:00:00 2001
+From: Chronium Build <chronium@interlink.local>
+Date: Fri, 5 Jun 2026 18:33:31 +0700
+Subject: [PATCH 07/14] chronium: per-profile
+ screen.{width,height,availWidth,availHeight,colorDepth} + devicePixelRatio
+
+Patches Screen and LocalDOMWindow so JS sees the profile's screen
+geometry instead of the host monitor's. width/height/availWidth/
+availHeight/colorDepth flow through Screen.cc, devicePixelRatio
+through LocalDOMWindow.cc. pixelDepth follows colorDepth (per spec).
+
+Plumbing: FingerprintProfile::ScreenCsv serialises the JSON 'screen'
+dict to 'W,H,AW,AH,CD,DPR'; AppendExtraCommandLineSwitches forwards
+it as --fingerprint-screen; the renderer parses in
+RenderThreadStarted and installs into blink::FingerprintState's new
+ScreenFp struct, which the patched blink getters read at top
+priority (before any DomWindow/Settings-based override).
+
+ScreenFp is POD so storage uses a plain function-local static
+(base::NoDestructor would static-assert on the trivial destructor).
+
+Verified with two profiles:
+  profile A: 1920x1080 / avail 1920x1040 / depth 24 / dpr 1
+  profile B: 1366x768 / avail 1366x728 / depth 30 / dpr 1.25
+
+Files touched:
+- chrome/common/chrome_switches.{h,cc}                 (kFingerprintScreen)
+- chrome/browser/fingerprint/fingerprint_profile.{h,cc} (ScreenCsv)
+- chrome/browser/chrome_content_browser_client.cc      (append switch)
+- chrome/renderer/chrome_content_renderer_client.cc    (parse + install)
+- third_party/blink/renderer/platform/fingerprint/
+    fingerprint_state.{h,cc}                           (ScreenFp + setter/getter)
+- third_party/blink/renderer/core/frame/screen.cc      (5 getters)
+- third_party/blink/renderer/core/frame/local_dom_window.cc
+                                                       (devicePixelRatio)
+---
+ .../browser/chrome_content_browser_client.cc  |  5 ++++
+ .../fingerprint/fingerprint_profile.cc        | 22 ++++++++++++++++
+ .../browser/fingerprint/fingerprint_profile.h |  4 +++
+ chrome/common/chrome_switches.cc              |  3 +++
+ chrome/common/chrome_switches.h               |  4 +++
+ .../chrome_content_renderer_client.cc         | 20 +++++++++++++++
+ .../renderer/core/frame/local_dom_window.cc   |  5 ++++
+ .../blink/renderer/core/frame/screen.cc       | 18 +++++++++++++
+ .../platform/fingerprint/fingerprint_state.cc | 25 +++++++++++++++++++
+ .../platform/fingerprint/fingerprint_state.h  | 15 +++++++++++
+ 10 files changed, 121 insertions(+)
+
+diff --git a/chrome/browser/chrome_content_browser_client.cc b/chrome/browser/chrome_content_browser_client.cc
+index 1feff0d1fd7ad..88bada72eb0db 100644
+--- a/chrome/browser/chrome_content_browser_client.cc
++++ b/chrome/browser/chrome_content_browser_client.cc
+@@ -2826,6 +2826,11 @@ void ChromeContentBrowserClient::AppendExtraCommandLineSwitches(
+         command_line->AppendSwitchASCII(switches::kFingerprintPlatform,
+                                         platform);
+       }
++      const std::string screen_csv = fp->ScreenCsv();
++      if (!screen_csv.empty()) {
++        command_line->AppendSwitchASCII(switches::kFingerprintScreen,
++                                        screen_csv);
++      }
+     }
+   }
+ #if BUILDFLAG(IS_MAC)
+diff --git a/chrome/browser/fingerprint/fingerprint_profile.cc b/chrome/browser/fingerprint/fingerprint_profile.cc
+index fff9735d62311..f88c04b973d5e 100644
+--- a/chrome/browser/fingerprint/fingerprint_profile.cc
++++ b/chrome/browser/fingerprint/fingerprint_profile.cc
+@@ -12,6 +12,7 @@
+ #include "base/files/file_util.h"
+ #include "base/json/json_reader.h"
+ #include "base/logging.h"
++#include "base/strings/stringprintf.h"
+ 
+ namespace chronium {
+ 
+@@ -104,6 +105,27 @@ std::string FingerprintProfile::Platform() const {
+   return s ? *s : std::string();
+ }
+ 
++std::string FingerprintProfile::ScreenCsv() const {
++  if (!loaded_) {
++    return {};
++  }
++  const base::DictValue* screen = dict_.FindDict("screen");
++  if (!screen) {
++    return {};
++  }
++  // All fields required for the override to take effect.
++  std::optional<int> w = screen->FindInt("width");
++  std::optional<int> h = screen->FindInt("height");
++  if (!w || !h || *w <= 0 || *h <= 0) {
++    return {};
++  }
++  int aw = screen->FindInt("avail_width").value_or(*w);
++  int ah = screen->FindInt("avail_height").value_or(*h);
++  int cd = screen->FindInt("color_depth").value_or(24);
++  double dpr = screen->FindDouble("device_pixel_ratio").value_or(1.0);
++  return base::StringPrintf("%d,%d,%d,%d,%d,%g", *w, *h, aw, ah, cd, dpr);
++}
++
+ bool FingerprintProfile::LoadFromFile(const base::FilePath& path) {
+   std::string contents;
+   if (!base::ReadFileToString(path, &contents)) {
+diff --git a/chrome/browser/fingerprint/fingerprint_profile.h b/chrome/browser/fingerprint/fingerprint_profile.h
+index 3915b2db375ad..c38f6caa992f2 100644
+--- a/chrome/browser/fingerprint/fingerprint_profile.h
++++ b/chrome/browser/fingerprint/fingerprint_profile.h
+@@ -75,6 +75,10 @@ class FingerprintProfile : public chrome::mojom::FingerprintConfigProvider {
+   // navigator.platform. Empty = no override.
+   std::string Platform() const;
+ 
++  // Screen properties as a comma-separated "W,H,AW,AH,CD,DPR" string ready
++  // for AppendSwitchASCII. Empty = no override.
++  std::string ScreenCsv() const;
++
+  private:
+   friend class base::NoDestructor<FingerprintProfile>;
+   FingerprintProfile();
+diff --git a/chrome/common/chrome_switches.cc b/chrome/common/chrome_switches.cc
+index 09a0725525350..96bff91ae6afe 100644
+--- a/chrome/common/chrome_switches.cc
++++ b/chrome/common/chrome_switches.cc
+@@ -361,6 +361,9 @@ const char kFingerprintWebGLRenderer[] = "fingerprint-webgl-renderer";
+ // Chronium (internal): navigator.platform override.
+ const char kFingerprintPlatform[] = "fingerprint-platform";
+ 
++// Chronium (internal): screen properties bundled "W,H,AW,AH,CD,DPR".
++const char kFingerprintScreen[] = "fingerprint-screen";
++
+ // Does not show the crash restore bubble when the browser is started during the
+ // system startup phase in ChromeOS, if the ChromeOS full restore feature is
+ // enabled, because the ChromeOS full restore notification is shown for the user
+diff --git a/chrome/common/chrome_switches.h b/chrome/common/chrome_switches.h
+index 9023e9a55ccf9..c47a21aa8fd9a 100644
+--- a/chrome/common/chrome_switches.h
++++ b/chrome/common/chrome_switches.h
+@@ -145,6 +145,10 @@ extern const char kFingerprintWebGLRenderer[];
+ // at browser startup.)
+ extern const char kFingerprintPlatform[];
+ 
++// Chronium (internal): per-profile screen properties, formatted as
++// "W,H,AW,AH,CD,DPR" (six comma-separated numbers).
++extern const char kFingerprintScreen[];
++
+ extern const char kHideCrashRestoreBubble[];
+ extern const char kHomePage[];
+ #if !BUILDFLAG(IS_ANDROID)
+diff --git a/chrome/renderer/chrome_content_renderer_client.cc b/chrome/renderer/chrome_content_renderer_client.cc
+index d1a7ba4e653a6..9782af9bc8f15 100644
+--- a/chrome/renderer/chrome_content_renderer_client.cc
++++ b/chrome/renderer/chrome_content_renderer_client.cc
+@@ -24,6 +24,7 @@
+ #include "base/process/current_process.h"
+ #include "base/profiler/thread_group_profiler.h"
+ #include "base/strings/string_number_conversions.h"
++#include "base/strings/string_split.h"
+ #include "base/strings/string_util.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/task/single_thread_task_runner.h"
+@@ -408,6 +409,25 @@ void ChromeContentRendererClient::RenderThreadStarted() {
+     if (!platform.empty()) {
+       blink::FingerprintState::SetPlatform(platform);
+     }
++    const std::string screen_csv =
++        cmd_line->GetSwitchValueASCII(switches::kFingerprintScreen);
++    if (!screen_csv.empty()) {
++      // Parse "W,H,AW,AH,CD,DPR" — six positive numbers.
++      std::vector<std::string> parts = base::SplitString(
++          screen_csv, ",", base::TRIM_WHITESPACE, base::SPLIT_WANT_ALL);
++      if (parts.size() == 6) {
++        blink::FingerprintState::ScreenFp s;
++        bool ok = base::StringToInt(parts[0], &s.width) &&
++                  base::StringToInt(parts[1], &s.height) &&
++                  base::StringToInt(parts[2], &s.avail_width) &&
++                  base::StringToInt(parts[3], &s.avail_height) &&
++                  base::StringToInt(parts[4], &s.color_depth) &&
++                  base::StringToDouble(parts[5], &s.device_pixel_ratio);
++        if (ok) {
++          blink::FingerprintState::SetScreen(s);
++        }
++      }
++    }
+   }
+ 
+   main_thread_profiler_->SetAuxUnwinderFactory(base::BindRepeating(
+diff --git a/third_party/blink/renderer/core/frame/local_dom_window.cc b/third_party/blink/renderer/core/frame/local_dom_window.cc
+index 51f03729c2d40..544c8a4a8ee28 100644
+--- a/third_party/blink/renderer/core/frame/local_dom_window.cc
++++ b/third_party/blink/renderer/core/frame/local_dom_window.cc
+@@ -150,6 +150,7 @@
+ #include "third_party/blink/renderer/core/view_transition/view_transition_supplement.h"
+ #include "third_party/blink/renderer/platform/back_forward_cache_buffer_limit_tracker.h"
+ #include "third_party/blink/renderer/platform/bindings/exception_messages.h"
++#include "third_party/blink/renderer/platform/fingerprint/fingerprint_state.h"
+ #include "third_party/blink/renderer/platform/bindings/script_state.h"
+ #include "third_party/blink/renderer/platform/bindings/source_location.h"
+ #include "third_party/blink/renderer/platform/blob/blob_url.h"
+@@ -1799,6 +1800,10 @@ CSSStyleDeclaration* LocalDOMWindow::getComputedStyle(
+ }
+ 
+ double LocalDOMWindow::devicePixelRatio() const {
++  if (const auto* fp = FingerprintState::Screen();
++      fp && fp->device_pixel_ratio > 0.0) {
++    return fp->device_pixel_ratio;
++  }
+   if (!GetFrame())
+     return 0.0;
+ 
+diff --git a/third_party/blink/renderer/core/frame/screen.cc b/third_party/blink/renderer/core/frame/screen.cc
+index 69ffc2b05f75d..45f5e72163fca 100644
+--- a/third_party/blink/renderer/core/frame/screen.cc
++++ b/third_party/blink/renderer/core/frame/screen.cc
+@@ -35,6 +35,7 @@
+ #include "third_party/blink/renderer/core/frame/local_frame.h"
+ #include "third_party/blink/renderer/core/frame/settings.h"
+ #include "third_party/blink/renderer/core/page/chrome_client.h"
++#include "third_party/blink/renderer/platform/fingerprint/fingerprint_state.h"
+ #include "ui/display/screen_info.h"
+ #include "ui/display/screen_infos.h"
+ 
+@@ -79,12 +80,18 @@ bool Screen::AreWebExposedScreenPropertiesEqual(
+ }
+ 
+ int Screen::height() const {
++  if (const auto* fp = FingerprintState::Screen()) {
++    return fp->height;
++  }
+   if (!DomWindow())
+     return 0;
+   return GetRect(/*available=*/false).height();
+ }
+ 
+ int Screen::width() const {
++  if (const auto* fp = FingerprintState::Screen()) {
++    return fp->width;
++  }
+   if (!DomWindow())
+     return 0;
+   return GetRect(/*available=*/false).width();
+@@ -97,6 +104,11 @@ unsigned Screen::colorDepth() const {
+   // https://drafts.csswg.org/cssom-view/#dom-screen-colordepth
+   unsigned unknown_color_depth = 24u;
+ 
++  if (const auto* fp = FingerprintState::Screen()) {
++    return fp->color_depth > 0
++               ? base::saturated_cast<unsigned>(fp->color_depth)
++               : unknown_color_depth;
++  }
+   if (!DomWindow()) {
+     return unknown_color_depth;
+   }
+@@ -122,12 +134,18 @@ int Screen::availTop() const {
+ }
+ 
+ int Screen::availHeight() const {
++  if (const auto* fp = FingerprintState::Screen()) {
++    return fp->avail_height;
++  }
+   if (!DomWindow())
+     return 0;
+   return GetRect(/*available=*/true).height();
+ }
+ 
+ int Screen::availWidth() const {
++  if (const auto* fp = FingerprintState::Screen()) {
++    return fp->avail_width;
++  }
+   if (!DomWindow())
+     return 0;
+   return GetRect(/*available=*/true).width();
+diff --git a/third_party/blink/renderer/platform/fingerprint/fingerprint_state.cc b/third_party/blink/renderer/platform/fingerprint/fingerprint_state.cc
+index 74f2c7e486aad..0e49f25f0a839 100644
+--- a/third_party/blink/renderer/platform/fingerprint/fingerprint_state.cc
++++ b/third_party/blink/renderer/platform/fingerprint/fingerprint_state.cc
+@@ -39,6 +39,13 @@ std::string& PlatformStorage() {
+ }
+ std::atomic<bool> g_platform_set{false};
+ 
++FingerprintState::ScreenFp& ScreenStorage() {
++  // POD with trivial destructor — base::NoDestructor would static-assert.
++  static FingerprintState::ScreenFp s;
++  return s;
++}
++std::atomic<bool> g_screen_set{false};
++
+ // xxHash-style scalar mix. Cryptographically weak but plenty good for
+ // distinguishing fingerprints. Deterministic for the same (seed, channel,
+ // x, y) tuple.
+@@ -135,6 +142,24 @@ std::string_view FingerprintState::Platform() {
+   return PlatformStorage();
+ }
+ 
++// static
++void FingerprintState::SetScreen(const ScreenFp& screen) {
++  if (g_screen_set.load(std::memory_order_acquire) || screen.width <= 0 ||
++      screen.height <= 0) {
++    return;
++  }
++  ScreenStorage() = screen;
++  g_screen_set.store(true, std::memory_order_release);
++}
++
++// static
++const FingerprintState::ScreenFp* FingerprintState::Screen() {
++  if (!g_screen_set.load(std::memory_order_acquire)) {
++    return nullptr;
++  }
++  return &ScreenStorage();
++}
++
+ // static
+ uint32_t FingerprintState::HashAt(std::string_view channel,
+                                   uint32_t x,
+diff --git a/third_party/blink/renderer/platform/fingerprint/fingerprint_state.h b/third_party/blink/renderer/platform/fingerprint/fingerprint_state.h
+index 6b75aa527409b..8abf710dc63eb 100644
+--- a/third_party/blink/renderer/platform/fingerprint/fingerprint_state.h
++++ b/third_party/blink/renderer/platform/fingerprint/fingerprint_state.h
+@@ -50,6 +50,21 @@ class PLATFORM_EXPORT FingerprintState {
+   static std::string_view WebGLUnmaskedRenderer();
+   static std::string_view Platform();
+ 
++  // Per-profile screen properties: width, height, availWidth, availHeight,
++  // colorDepth, devicePixelRatio. Width<=0 means "not set" -- callers
++  // must fall back to the platform value.
++  struct ScreenFp {
++    int width = 0;
++    int height = 0;
++    int avail_width = 0;
++    int avail_height = 0;
++    int color_depth = 0;
++    double device_pixel_ratio = 0.0;
++  };
++  static void SetScreen(const ScreenFp& screen);
++  // Returns nullptr when no override is in effect.
++  static const ScreenFp* Screen();
++
+   // Deterministic 32-bit hash of (process seed, channel, x, y).
+   // |channel| should be a short stable string identifying the fingerprint
+   // surface, e.g. "canvas", "webgl-readpixels", "audio".
+-- 
+2.54.0.windows.1
+

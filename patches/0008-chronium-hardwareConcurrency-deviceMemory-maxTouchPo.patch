@@ -1,0 +1,544 @@
+From a109ea09733a1f3d1cc0abb839717e6a8099876c Mon Sep 17 00:00:00 2001
+From: Chronium Build <chronium@interlink.local>
+Date: Mon, 8 Jun 2026 07:44:53 +0700
+Subject: [PATCH 08/14] chronium: hardwareConcurrency + deviceMemory +
+ maxTouchPoints + Battery + WebRTC
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Bundles four small but high-value spoofs on shared infra. Each is
+independently checkable.
+
+Hardware (NavigatorConcurrentHardware, NavigatorDeviceMemory,
+NavigatorEvents::maxTouchPoints): per-profile hardware_concurrency,
+device_memory, and max_touch_points override the host machine's
+values when the corresponding HardwareFp is set in
+blink::FingerprintState. Stops the fingerprinter from learning that
+'the browser claims to be a 4-core Intel laptop but the CPU reports
+28 logical cores' (the kind of cross-vector inconsistency Google
+flags).
+
+Battery (BatteryManager 4 methods): level/charging/chargingTime/
+dischargingTime now come from the profile. negative charging_time /
+discharging_time map to Infinity per spec when the device is at the
+respective extreme.
+
+WebRTC IP leak (peer_connection_dependency_factory): when
+FingerprintState carries a non-default policy (1=proxy_only,
+2=public_only), we set port_config.enable_multiple_routes=false,
+enable_default_local_candidate=false, and enable_nonproxied_udp=
+false (proxy_only) before the existing Platform routing-preferences
+path can populate anything. This is the patch §5 #8 'WebRTC IP
+leak' fix — the LAN address simply cannot appear in ICE candidates
+because the underlying network manager isn't told to enumerate
+those interfaces.
+
+Plumbing (same pattern as patches 0006/0007): 4 new chrome_switches
+(kFingerprintHardware, kFingerprintBattery, kFingerprintWebRtcPolicy,
+plus the existing kFingerprintScreen lane), 3 new
+FingerprintProfile CSV serialisers, 3 new FingerprintState struct
+storages + setters/getters. WebRTC policy is a simple atomic<int>.
+
+Verified on profile B:
+  navigator.hardwareConcurrency : 4
+  navigator.deviceMemory        : 4 (requires SecureContext, tested
+                                     on https://example.com)
+  navigator.maxTouchPoints      : 5
+  navigator.getBattery()        : level 0.87, charging true,
+                                  chargingTime/dischargingTime
+                                  Infinity (matches JSON)
+
+Files touched:
+- chrome/common/chrome_switches.{h,cc}
+- chrome/browser/fingerprint/fingerprint_profile.{h,cc}
+- chrome/browser/chrome_content_browser_client.cc
+- chrome/renderer/chrome_content_renderer_client.cc
+- third_party/blink/renderer/platform/fingerprint/fingerprint_state.{h,cc}
+- third_party/blink/renderer/core/frame/navigator_concurrent_hardware.cc
+- third_party/blink/renderer/core/frame/navigator_device_memory.cc
+- third_party/blink/renderer/core/events/navigator_events.cc
+- third_party/blink/renderer/modules/battery/battery_manager.cc
+- third_party/blink/renderer/modules/peerconnection/peer_connection_dependency_factory.cc
+---
+ .../browser/chrome_content_browser_client.cc  | 15 +++++
+ .../fingerprint/fingerprint_profile.cc        | 51 ++++++++++++++++
+ .../browser/fingerprint/fingerprint_profile.h |  9 +++
+ chrome/common/chrome_switches.cc              |  4 ++
+ chrome/common/chrome_switches.h               | 10 ++++
+ .../chrome_content_renderer_client.cc         | 41 +++++++++++++
+ .../renderer/core/events/navigator_events.cc  |  4 ++
+ .../frame/navigator_concurrent_hardware.cc    |  4 ++
+ .../core/frame/navigator_device_memory.cc     |  5 ++
+ .../modules/battery/battery_manager.cc        | 18 ++++++
+ .../peer_connection_dependency_factory.cc     | 17 +++++-
+ .../platform/fingerprint/fingerprint_state.cc | 60 +++++++++++++++++++
+ .../platform/fingerprint/fingerprint_state.h  | 30 ++++++++++
+ 13 files changed, 267 insertions(+), 1 deletion(-)
+
+diff --git a/chrome/browser/chrome_content_browser_client.cc b/chrome/browser/chrome_content_browser_client.cc
+index 88bada72eb0db..4f8cf8f59b8d2 100644
+--- a/chrome/browser/chrome_content_browser_client.cc
++++ b/chrome/browser/chrome_content_browser_client.cc
+@@ -2831,6 +2831,21 @@ void ChromeContentBrowserClient::AppendExtraCommandLineSwitches(
+         command_line->AppendSwitchASCII(switches::kFingerprintScreen,
+                                         screen_csv);
+       }
++      const std::string hw_csv = fp->HardwareCsv();
++      if (!hw_csv.empty()) {
++        command_line->AppendSwitchASCII(switches::kFingerprintHardware,
++                                        hw_csv);
++      }
++      const std::string bat_csv = fp->BatteryCsv();
++      if (!bat_csv.empty()) {
++        command_line->AppendSwitchASCII(switches::kFingerprintBattery,
++                                        bat_csv);
++      }
++      const std::string webrtc = fp->WebRtcPolicyValue();
++      if (!webrtc.empty()) {
++        command_line->AppendSwitchASCII(switches::kFingerprintWebRtcPolicy,
++                                        webrtc);
++      }
+     }
+   }
+ #if BUILDFLAG(IS_MAC)
+diff --git a/chrome/browser/fingerprint/fingerprint_profile.cc b/chrome/browser/fingerprint/fingerprint_profile.cc
+index f88c04b973d5e..d9429a5297669 100644
+--- a/chrome/browser/fingerprint/fingerprint_profile.cc
++++ b/chrome/browser/fingerprint/fingerprint_profile.cc
+@@ -126,6 +126,57 @@ std::string FingerprintProfile::ScreenCsv() const {
+   return base::StringPrintf("%d,%d,%d,%d,%d,%g", *w, *h, aw, ah, cd, dpr);
+ }
+ 
++std::string FingerprintProfile::HardwareCsv() const {
++  if (!loaded_) {
++    return {};
++  }
++  std::optional<int> conc = dict_.FindInt("hardware_concurrency");
++  if (!conc || *conc <= 0) {
++    return {};
++  }
++  double dm = dict_.FindDouble("device_memory").value_or(4.0);
++  int mtp = dict_.FindInt("max_touch_points").value_or(0);
++  return base::StringPrintf("%d,%g,%d", *conc, dm, mtp);
++}
++
++std::string FingerprintProfile::BatteryCsv() const {
++  if (!loaded_) {
++    return {};
++  }
++  const base::DictValue* bat = dict_.FindDict("battery");
++  if (!bat) {
++    return {};
++  }
++  std::optional<double> level = bat->FindDouble("level");
++  if (!level) {
++    return {};
++  }
++  std::optional<bool> charging = bat->FindBool("charging");
++  // charging_time / discharging_time may be null in JSON for plugged in /
++  // unplugged states; represent that as -1.
++  double ct = bat->FindDouble("charging_time").value_or(-1.0);
++  double dt = bat->FindDouble("discharging_time").value_or(-1.0);
++  return base::StringPrintf("%g,%d,%g,%g", *level,
++                            charging.value_or(true) ? 1 : 0, ct, dt);
++}
++
++std::string FingerprintProfile::WebRtcPolicyValue() const {
++  if (!loaded_) {
++    return {};
++  }
++  const std::string* mode = dict_.FindString("webrtc_policy");
++  if (!mode) {
++    return {};
++  }
++  if (*mode == "proxy_only") {
++    return "1";
++  }
++  if (*mode == "public_only" || *mode == "disabled") {
++    return "2";
++  }
++  return {};
++}
++
+ bool FingerprintProfile::LoadFromFile(const base::FilePath& path) {
+   std::string contents;
+   if (!base::ReadFileToString(path, &contents)) {
+diff --git a/chrome/browser/fingerprint/fingerprint_profile.h b/chrome/browser/fingerprint/fingerprint_profile.h
+index c38f6caa992f2..80a62f4feb8ac 100644
+--- a/chrome/browser/fingerprint/fingerprint_profile.h
++++ b/chrome/browser/fingerprint/fingerprint_profile.h
+@@ -79,6 +79,15 @@ class FingerprintProfile : public chrome::mojom::FingerprintConfigProvider {
+   // for AppendSwitchASCII. Empty = no override.
+   std::string ScreenCsv() const;
+ 
++  // "concurrency,deviceMemory,maxTouchPoints". Empty = no override.
++  std::string HardwareCsv() const;
++
++  // "level,charging(0|1),chargingTime,dischargingTime". Empty = no override.
++  std::string BatteryCsv() const;
++
++  // "1" (proxy_only) | "2" (public_only) | "" (no override).
++  std::string WebRtcPolicyValue() const;
++
+  private:
+   friend class base::NoDestructor<FingerprintProfile>;
+   FingerprintProfile();
+diff --git a/chrome/common/chrome_switches.cc b/chrome/common/chrome_switches.cc
+index 96bff91ae6afe..eff84f980c9c2 100644
+--- a/chrome/common/chrome_switches.cc
++++ b/chrome/common/chrome_switches.cc
+@@ -364,6 +364,10 @@ const char kFingerprintPlatform[] = "fingerprint-platform";
+ // Chronium (internal): screen properties bundled "W,H,AW,AH,CD,DPR".
+ const char kFingerprintScreen[] = "fingerprint-screen";
+ 
++const char kFingerprintHardware[] = "fingerprint-hardware";
++const char kFingerprintBattery[] = "fingerprint-battery";
++const char kFingerprintWebRtcPolicy[] = "fingerprint-webrtc-policy";
++
+ // Does not show the crash restore bubble when the browser is started during the
+ // system startup phase in ChromeOS, if the ChromeOS full restore feature is
+ // enabled, because the ChromeOS full restore notification is shown for the user
+diff --git a/chrome/common/chrome_switches.h b/chrome/common/chrome_switches.h
+index c47a21aa8fd9a..b3bfa860997d9 100644
+--- a/chrome/common/chrome_switches.h
++++ b/chrome/common/chrome_switches.h
+@@ -149,6 +149,16 @@ extern const char kFingerprintPlatform[];
+ // "W,H,AW,AH,CD,DPR" (six comma-separated numbers).
+ extern const char kFingerprintScreen[];
+ 
++// Chronium (internal): "concurrency,deviceMemory,maxTouchPoints".
++extern const char kFingerprintHardware[];
++
++// Chronium (internal): "level,charging(0|1),chargingTime,dischargingTime".
++extern const char kFingerprintBattery[];
++
++// Chronium (internal): WebRTC IP handling policy. 1=proxy_only,
++// 2=public_only.
++extern const char kFingerprintWebRtcPolicy[];
++
+ extern const char kHideCrashRestoreBubble[];
+ extern const char kHomePage[];
+ #if !BUILDFLAG(IS_ANDROID)
+diff --git a/chrome/renderer/chrome_content_renderer_client.cc b/chrome/renderer/chrome_content_renderer_client.cc
+index 9782af9bc8f15..64f6e52e2803f 100644
+--- a/chrome/renderer/chrome_content_renderer_client.cc
++++ b/chrome/renderer/chrome_content_renderer_client.cc
+@@ -428,6 +428,47 @@ void ChromeContentRendererClient::RenderThreadStarted() {
+         }
+       }
+     }
++    const std::string hw_csv =
++        cmd_line->GetSwitchValueASCII(switches::kFingerprintHardware);
++    if (!hw_csv.empty()) {
++      std::vector<std::string> parts = base::SplitString(
++          hw_csv, ",", base::TRIM_WHITESPACE, base::SPLIT_WANT_ALL);
++      if (parts.size() == 3) {
++        blink::FingerprintState::HardwareFp h;
++        int c = 0, mtp = 0;
++        if (base::StringToInt(parts[0], &c) &&
++            base::StringToDouble(parts[1], &h.device_memory) &&
++            base::StringToInt(parts[2], &mtp) && c > 0) {
++          h.concurrency = static_cast<unsigned>(c);
++          h.max_touch_points = static_cast<unsigned>(mtp);
++          blink::FingerprintState::SetHardware(h);
++        }
++      }
++    }
++    const std::string bat_csv =
++        cmd_line->GetSwitchValueASCII(switches::kFingerprintBattery);
++    if (!bat_csv.empty()) {
++      std::vector<std::string> parts = base::SplitString(
++          bat_csv, ",", base::TRIM_WHITESPACE, base::SPLIT_WANT_ALL);
++      if (parts.size() == 4) {
++        blink::FingerprintState::BatteryFp b;
++        int charging = 1;
++        if (base::StringToDouble(parts[0], &b.level) &&
++            base::StringToInt(parts[1], &charging) &&
++            base::StringToDouble(parts[2], &b.charging_time) &&
++            base::StringToDouble(parts[3], &b.discharging_time)) {
++          b.charging = (charging != 0);
++          blink::FingerprintState::SetBattery(b);
++        }
++      }
++    }
++    const std::string webrtc_policy =
++        cmd_line->GetSwitchValueASCII(switches::kFingerprintWebRtcPolicy);
++    int wp = 0;
++    if (base::StringToInt(webrtc_policy, &wp) && wp >= 1 && wp <= 2) {
++      blink::FingerprintState::SetWebRtcPolicy(
++          static_cast<blink::FingerprintState::WebRtcPolicy>(wp));
++    }
+   }
+ 
+   main_thread_profiler_->SetAuxUnwinderFactory(base::BindRepeating(
+diff --git a/third_party/blink/renderer/core/events/navigator_events.cc b/third_party/blink/renderer/core/events/navigator_events.cc
+index a57561775c119..218bbd6c0206c 100644
+--- a/third_party/blink/renderer/core/events/navigator_events.cc
++++ b/third_party/blink/renderer/core/events/navigator_events.cc
+@@ -34,10 +34,14 @@
+ #include "third_party/blink/renderer/core/frame/local_frame.h"
+ #include "third_party/blink/renderer/core/frame/navigator.h"
+ #include "third_party/blink/renderer/core/frame/settings.h"
++#include "third_party/blink/renderer/platform/fingerprint/fingerprint_state.h"
+ 
+ namespace blink {
+ 
+ int32_t NavigatorEvents::maxTouchPoints(Navigator& navigator) {
++  if (const auto* fp = FingerprintState::Hardware()) {
++    return static_cast<int32_t>(fp->max_touch_points);
++  }
+   LocalDOMWindow* window = navigator.DomWindow();
+   return window ? window->GetFrame()->GetSettings()->GetMaxTouchPoints() : 0;
+ }
+diff --git a/third_party/blink/renderer/core/frame/navigator_concurrent_hardware.cc b/third_party/blink/renderer/core/frame/navigator_concurrent_hardware.cc
+index f5c0db2d1b58d..95035c6fbe7fc 100644
+--- a/third_party/blink/renderer/core/frame/navigator_concurrent_hardware.cc
++++ b/third_party/blink/renderer/core/frame/navigator_concurrent_hardware.cc
+@@ -5,10 +5,14 @@
+ #include "third_party/blink/renderer/core/frame/navigator_concurrent_hardware.h"
+ 
+ #include "base/system/sys_info.h"
++#include "third_party/blink/renderer/platform/fingerprint/fingerprint_state.h"
+ 
+ namespace blink {
+ 
+ unsigned NavigatorConcurrentHardware::hardwareConcurrency() const {
++  if (const auto* fp = FingerprintState::Hardware()) {
++    return fp->concurrency;
++  }
+   return static_cast<unsigned>(base::SysInfo::NumberOfProcessors());
+ }
+ 
+diff --git a/third_party/blink/renderer/core/frame/navigator_device_memory.cc b/third_party/blink/renderer/core/frame/navigator_device_memory.cc
+index 05fa33e4568e8..b23bbe438ad1b 100644
+--- a/third_party/blink/renderer/core/frame/navigator_device_memory.cc
++++ b/third_party/blink/renderer/core/frame/navigator_device_memory.cc
+@@ -8,10 +8,15 @@
+ #include "third_party/blink/public/mojom/use_counter/metrics/web_feature.mojom-shared.h"
+ #include "third_party/blink/renderer/core/dom/document.h"
+ #include "third_party/blink/renderer/core/frame/local_dom_window.h"
++#include "third_party/blink/renderer/platform/fingerprint/fingerprint_state.h"
+ 
+ namespace blink {
+ 
+ float NavigatorDeviceMemory::deviceMemory() const {
++  if (const auto* fp = FingerprintState::Hardware();
++      fp && fp->device_memory > 0.0) {
++    return static_cast<float>(fp->device_memory);
++  }
+   return ApproximatedDeviceMemory::GetApproximatedDeviceMemory();
+ }
+ 
+diff --git a/third_party/blink/renderer/modules/battery/battery_manager.cc b/third_party/blink/renderer/modules/battery/battery_manager.cc
+index 51cdc75ceee61..7a87ebdad69dc 100644
+--- a/third_party/blink/renderer/modules/battery/battery_manager.cc
++++ b/third_party/blink/renderer/modules/battery/battery_manager.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "third_party/blink/renderer/modules/battery/battery_manager.h"
+ 
++#include <limits>
++
+ #include "third_party/blink/public/mojom/frame/lifecycle.mojom-blink.h"
+ #include "third_party/blink/renderer/core/dom/dom_exception.h"
+ #include "third_party/blink/renderer/core/dom/events/event.h"
+@@ -13,6 +15,7 @@
+ #include "third_party/blink/renderer/core/frame/navigator.h"
+ #include "third_party/blink/renderer/core/frame/web_feature.h"
+ #include "third_party/blink/renderer/modules/battery/battery_dispatcher.h"
++#include "third_party/blink/renderer/platform/fingerprint/fingerprint_state.h"
+ 
+ namespace blink {
+ 
+@@ -80,18 +83,33 @@ ScriptPromise<BatteryManager> BatteryManager::StartRequest(
+ }
+ 
+ bool BatteryManager::charging() {
++  if (const auto* fp = FingerprintState::Battery()) {
++    return fp->charging;
++  }
+   return battery_status_.Charging();
+ }
+ 
+ double BatteryManager::chargingTime() {
++  if (const auto* fp = FingerprintState::Battery()) {
++    return fp->charging_time < 0.0 ? std::numeric_limits<double>::infinity()
++                                   : fp->charging_time;
++  }
+   return battery_status_.charging_time().InSecondsF();
+ }
+ 
+ double BatteryManager::dischargingTime() {
++  if (const auto* fp = FingerprintState::Battery()) {
++    return fp->discharging_time < 0.0
++               ? std::numeric_limits<double>::infinity()
++               : fp->discharging_time;
++  }
+   return battery_status_.discharging_time().InSecondsF();
+ }
+ 
+ double BatteryManager::level() {
++  if (const auto* fp = FingerprintState::Battery()) {
++    return fp->level;
++  }
+   return battery_status_.Level();
+ }
+ 
+diff --git a/third_party/blink/renderer/modules/peerconnection/peer_connection_dependency_factory.cc b/third_party/blink/renderer/modules/peerconnection/peer_connection_dependency_factory.cc
+index 8c62905871ef9..daf04e1abc165 100644
+--- a/third_party/blink/renderer/modules/peerconnection/peer_connection_dependency_factory.cc
++++ b/third_party/blink/renderer/modules/peerconnection/peer_connection_dependency_factory.cc
+@@ -43,6 +43,7 @@
+ #include "third_party/blink/public/common/features.h"
+ #include "third_party/blink/public/common/peerconnection/webrtc_ip_handling_policy.h"
+ #include "third_party/blink/public/mojom/peerconnection/webrtc_ip_handling_policy.mojom-blink.h"
++#include "third_party/blink/renderer/platform/fingerprint/fingerprint_state.h"
+ #include "third_party/blink/public/mojom/permissions/permission.mojom-blink.h"
+ #include "third_party/blink/public/mojom/permissions/permission_status.mojom-blink.h"
+ #include "third_party/blink/public/platform/modules/webrtc/webrtc_logging.h"
+@@ -1055,7 +1056,21 @@ PeerConnectionDependencyFactory::CreatePortAllocator(
+   // detached, it is impossible for RTCPeerConnectionHandler to outlive the
+   // frame. Therefore using a raw pointer of |media_permission| is safe here.
+   media::MediaPermission* media_permission = nullptr;
+-  if (!Platform::Current()->ShouldEnforceWebRTCRoutingPreferences()) {
++  // Chronium: per-profile WebRTC IP policy override has top priority. When
++  // active, disable nonproxied UDP and multi-route discovery so the real
++  // host IP (LAN address) cannot leak via ICE candidates. This is the
++  // patch §5 #8 "WebRTC IP leak" fix.
++  const FingerprintState::WebRtcPolicy chronium_policy =
++      FingerprintState::GetWebRtcPolicy();
++  if (chronium_policy == FingerprintState::WebRtcPolicy::kProxyOnly) {
++    port_config.enable_multiple_routes = false;
++    port_config.enable_nonproxied_udp = false;
++    port_config.enable_default_local_candidate = false;
++  } else if (chronium_policy == FingerprintState::WebRtcPolicy::kPublicOnly) {
++    port_config.enable_multiple_routes = false;
++    port_config.enable_nonproxied_udp = true;
++    port_config.enable_default_local_candidate = false;
++  } else if (!Platform::Current()->ShouldEnforceWebRTCRoutingPreferences()) {
+     port_config.enable_multiple_routes = true;
+     port_config.enable_nonproxied_udp = true;
+     VLOG(3) << "WebRTC routing preferences will not be enforced";
+diff --git a/third_party/blink/renderer/platform/fingerprint/fingerprint_state.cc b/third_party/blink/renderer/platform/fingerprint/fingerprint_state.cc
+index 0e49f25f0a839..3c522cfe7274c 100644
+--- a/third_party/blink/renderer/platform/fingerprint/fingerprint_state.cc
++++ b/third_party/blink/renderer/platform/fingerprint/fingerprint_state.cc
+@@ -46,6 +46,20 @@ FingerprintState::ScreenFp& ScreenStorage() {
+ }
+ std::atomic<bool> g_screen_set{false};
+ 
++FingerprintState::HardwareFp& HardwareStorage() {
++  static FingerprintState::HardwareFp s;
++  return s;
++}
++std::atomic<bool> g_hw_set{false};
++
++FingerprintState::BatteryFp& BatteryStorage() {
++  static FingerprintState::BatteryFp s;
++  return s;
++}
++std::atomic<bool> g_battery_set{false};
++
++std::atomic<int> g_webrtc_policy{0};
++
+ // xxHash-style scalar mix. Cryptographically weak but plenty good for
+ // distinguishing fingerprints. Deterministic for the same (seed, channel,
+ // x, y) tuple.
+@@ -160,6 +174,52 @@ const FingerprintState::ScreenFp* FingerprintState::Screen() {
+   return &ScreenStorage();
+ }
+ 
++// static
++void FingerprintState::SetHardware(const HardwareFp& hw) {
++  if (g_hw_set.load(std::memory_order_acquire) || hw.concurrency == 0) {
++    return;
++  }
++  HardwareStorage() = hw;
++  g_hw_set.store(true, std::memory_order_release);
++}
++
++// static
++const FingerprintState::HardwareFp* FingerprintState::Hardware() {
++  if (!g_hw_set.load(std::memory_order_acquire)) {
++    return nullptr;
++  }
++  return &HardwareStorage();
++}
++
++// static
++void FingerprintState::SetBattery(const BatteryFp& battery) {
++  if (g_battery_set.load(std::memory_order_acquire) || battery.level < 0.0) {
++    return;
++  }
++  BatteryStorage() = battery;
++  g_battery_set.store(true, std::memory_order_release);
++}
++
++// static
++const FingerprintState::BatteryFp* FingerprintState::Battery() {
++  if (!g_battery_set.load(std::memory_order_acquire)) {
++    return nullptr;
++  }
++  return &BatteryStorage();
++}
++
++// static
++void FingerprintState::SetWebRtcPolicy(WebRtcPolicy policy) {
++  int expected = 0;
++  g_webrtc_policy.compare_exchange_strong(expected, static_cast<int>(policy),
++                                          std::memory_order_acq_rel);
++}
++
++// static
++FingerprintState::WebRtcPolicy FingerprintState::GetWebRtcPolicy() {
++  return static_cast<WebRtcPolicy>(g_webrtc_policy.load(std::memory_order_acquire));
++}
++
+ // static
+ uint32_t FingerprintState::HashAt(std::string_view channel,
+                                   uint32_t x,
+diff --git a/third_party/blink/renderer/platform/fingerprint/fingerprint_state.h b/third_party/blink/renderer/platform/fingerprint/fingerprint_state.h
+index 8abf710dc63eb..e42edf279c9a0 100644
+--- a/third_party/blink/renderer/platform/fingerprint/fingerprint_state.h
++++ b/third_party/blink/renderer/platform/fingerprint/fingerprint_state.h
+@@ -65,6 +65,36 @@ class PLATFORM_EXPORT FingerprintState {
+   // Returns nullptr when no override is in effect.
+   static const ScreenFp* Screen();
+ 
++  // navigator.hardwareConcurrency / navigator.deviceMemory /
++  // navigator.maxTouchPoints. concurrency==0 means "not set".
++  struct HardwareFp {
++    unsigned concurrency = 0;
++    double device_memory = 0.0;
++    unsigned max_touch_points = 0;
++  };
++  static void SetHardware(const HardwareFp& hw);
++  static const HardwareFp* Hardware();
++
++  // BatteryManager fields. level<0 means "not set".
++  struct BatteryFp {
++    double level = -1.0;
++    bool charging = true;
++    double charging_time = 0.0;
++    double discharging_time = 0.0;
++  };
++  static void SetBattery(const BatteryFp& battery);
++  static const BatteryFp* Battery();
++
++  // WebRTC IP handling policy override. 0 = no override, 1 = relay-only
++  // (kDisableNonProxiedUdp), 2 = public-interface-only.
++  enum class WebRtcPolicy : int {
++    kNone = 0,
++    kProxyOnly = 1,
++    kPublicOnly = 2,
++  };
++  static void SetWebRtcPolicy(WebRtcPolicy policy);
++  static WebRtcPolicy GetWebRtcPolicy();
++
+   // Deterministic 32-bit hash of (process seed, channel, x, y).
+   // |channel| should be a short stable string identifying the fingerprint
+   // surface, e.g. "canvas", "webgl-readpixels", "audio".
+-- 
+2.54.0.windows.1
+

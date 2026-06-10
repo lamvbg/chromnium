@@ -1,0 +1,130 @@
+{
+  "schema_version": 1,
+  "seed": "ff112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+  "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+  "user_agent_data": {
+    "brands": [
+      { "brand": "Chromium",       "version": "130" },
+      { "brand": "Google Chrome",  "version": "130" },
+      { "brand": "Not?A_Brand",    "version": "99"  }
+    ],
+    "full_version_list": [
+      { "brand": "Chromium",       "version": "130.0.6723.117" },
+      { "brand": "Google Chrome",  "version": "130.0.6723.117" },
+      { "brand": "Not?A_Brand",    "version": "99.0.0.0"       }
+    ],
+    "platform":        "macOS",
+    "platform_version":"14.5.0",
+    "architecture":    "arm",
+    "bitness":         "64",
+    "model":           "",
+    "mobile":          false,
+    "wow64":           false
+  },
+  "platform": "MacIntel",
+  "vendor": "Google Inc.",
+  "accept_language": "en-US,en;q=0.9",
+  "languages": ["vi-VN", "vi", "en-US", "en"],
+  "screen": {
+    "width": 1366,
+    "height": 768,
+    "avail_width": 1366,
+    "avail_height": 728,
+    "color_depth": 30,
+    "pixel_depth": 30,
+    "device_pixel_ratio": 1.25
+  },
+  "hardware_concurrency": 4,
+  "device_memory": 4,
+  "max_touch_points": 5,
+  "timezone": "Asia/Ho_Chi_Minh",
+  "locale": "en-US",
+  "geolocation": {
+    "latitude": 40.7128,
+    "longitude": -74.006,
+    "accuracy": 100
+  },
+  "webgl": {
+    "vendor":            "Google Inc. (Intel)",
+    "renderer":          "ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+    "unmasked_vendor":   "Intel Inc.",
+    "unmasked_renderer": "Intel(R) UHD Graphics 630",
+    "version":           "WebGL 2.0 (OpenGL ES 3.0 Chromium)",
+    "max_texture_size":  16384,
+    "max_vertex_attribs": 16
+  },
+  "memory": {
+    "heap_size_limit": "4294705152"
+  },
+  "connection": {
+    "effective_type": "4g",
+    "downlink_mbps":  10.0,
+    "rtt_msec":       75,
+    "save_data":      false
+  },
+  "storage_estimate": {
+    "quota_gb": 10
+  },
+  "speech": {
+    "voices": [
+      { "name": "Albert",            "lang": "en-US", "is_default": false, "local_service": true,  "voice_uri": "com.apple.speech.synthesis.voice.Albert" },
+      { "name": "Alice",             "lang": "it-IT", "is_default": false, "local_service": true,  "voice_uri": "com.apple.speech.synthesis.voice.alice" },
+      { "name": "Alva",              "lang": "sv-SE", "is_default": false, "local_service": true,  "voice_uri": "com.apple.speech.synthesis.voice.alva" },
+      { "name": "Amelie",            "lang": "fr-CA", "is_default": false, "local_service": true,  "voice_uri": "com.apple.speech.synthesis.voice.amelie" },
+      { "name": "Anna",              "lang": "de-DE", "is_default": false, "local_service": true,  "voice_uri": "com.apple.speech.synthesis.voice.anna" },
+      { "name": "Carmit",            "lang": "he-IL", "is_default": false, "local_service": true,  "voice_uri": "com.apple.speech.synthesis.voice.carmit" },
+      { "name": "Damayanti",         "lang": "id-ID", "is_default": false, "local_service": true,  "voice_uri": "com.apple.speech.synthesis.voice.damayanti" },
+      { "name": "Daniel",            "lang": "en-GB", "is_default": false, "local_service": true,  "voice_uri": "com.apple.speech.synthesis.voice.daniel" },
+      { "name": "Diego",             "lang": "es-AR", "is_default": false, "local_service": true,  "voice_uri": "com.apple.speech.synthesis.voice.diego" },
+      { "name": "Fred",              "lang": "en-US", "is_default": false, "local_service": true,  "voice_uri": "com.apple.speech.synthesis.voice.Fred" },
+      { "name": "Karen",             "lang": "en-AU", "is_default": false, "local_service": true,  "voice_uri": "com.apple.speech.synthesis.voice.karen" },
+      { "name": "Samantha",          "lang": "en-US", "is_default": true,  "local_service": true,  "voice_uri": "com.apple.speech.synthesis.voice.samantha" },
+      { "name": "Google US English", "lang": "en-US", "is_default": false, "local_service": false, "voice_uri": "Google US English" },
+      { "name": "Google UK English Female", "lang": "en-GB", "is_default": false, "local_service": false, "voice_uri": "Google UK English Female" },
+      { "name": "Google UK English Male",   "lang": "en-GB", "is_default": false, "local_service": false, "voice_uri": "Google UK English Male" },
+      { "name": "Google français",   "lang": "fr-FR", "is_default": false, "local_service": false, "voice_uri": "Google français" },
+      { "name": "Google Deutsch",    "lang": "de-DE", "is_default": false, "local_service": false, "voice_uri": "Google Deutsch" },
+      { "name": "Google 日本語",       "lang": "ja-JP", "is_default": false, "local_service": false, "voice_uri": "Google 日本語" }
+    ]
+  },
+  "fonts": [
+    "Arial", "Arial Black", "Calibri", "Cambria", "Cambria Math",
+    "Comic Sans MS", "Consolas", "Courier New", "Georgia", "Impact",
+    "Lucida Console", "Microsoft Sans Serif", "Segoe UI", "Tahoma",
+    "Times New Roman", "Trebuchet MS", "Verdana", "Webdings"
+  ],
+  "plugins": [
+    {
+      "name":        "PDF Viewer",
+      "description": "Portable Document Format",
+      "filename":    "internal-pdf-viewer"
+    },
+    {
+      "name":        "Chrome PDF Viewer",
+      "description": "Portable Document Format",
+      "filename":    "internal-pdf-viewer"
+    }
+  ],
+  "mime_types": [
+    { "type": "application/pdf", "suffixes": "pdf", "description": "Portable Document Format" }
+  ],
+  "media_devices": [
+    { "kind": "audioinput",  "label": "Default - Microphone (Realtek Audio)" },
+    { "kind": "audiooutput", "label": "Default - Speakers (Realtek Audio)"   },
+    { "kind": "videoinput",  "label": "Integrated Camera"                    }
+  ],
+  "battery": {
+    "level": 0.87,
+    "charging": true,
+    "charging_time": null,
+    "discharging_time": null
+  },
+  "webrtc_policy": "proxy_only",
+  "noise": {
+    "canvas_threshold":      0.001,
+    "webgl_readpixels":      true,
+    "audio_amplitude":       1e-7,
+    "clientrects_subpixel":  1e-5,
+    "measure_text_subpixel": 1e-5
+  }
+}

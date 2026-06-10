@@ -1,0 +1,287 @@
+From b65af4087efc0c94cc3ec7a4b92cb1e1dc906673 Mon Sep 17 00:00:00 2001
+From: Chronium Build <chronium@interlink.local>
+Date: Mon, 8 Jun 2026 09:38:47 +0700
+Subject: [PATCH 10/14] chronium: hide navigator.webdriver + per-profile IANA
+ timezone override
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Two unrelated but small surfaces in one patch. Both gated by the
+existing FingerprintState plumbing.
+
+navigator.webdriver
+  Plan §5 #18 'CDP hide webdriver'. When a fingerprint profile is
+  active, Navigator::webdriver() returns false unconditionally,
+  shortcircuiting the AutomationControlled runtime feature and the
+  DevTools probe override. Real Chrome user sessions return false;
+  fingerprinters treat any true value as a hard automation flag
+  regardless of how well the rest of the fingerprint matches.
+
+IANA timezone override (plan §5 #12)
+  TimeZoneController::Init() now reads --fingerprint-timezone
+  directly from the command line and calls the same
+  SetTimeZoneOverride() RAII path DevTools emulation uses. The
+  returned handle is intentionally leaked so the override persists
+  for the renderer process lifetime.
+
+  KEY DESIGN POINT: Init() runs from CoreInitializer (invoked by
+  InitializeWebKit in RenderThreadImpl) BEFORE
+  ChromeContentRendererClient::RenderThreadStarted populates
+  FingerprintState. So we must read the command-line switch
+  directly here — the switch is set at process spawn so it's
+  always available. We also mirror it into FingerprintState so
+  later patches that consume the typed accessor see a consistent
+  view.
+
+  This drives ICU's default time zone and triggers
+  v8::Isolate::DateTimeConfigurationChangeNotification under the
+  hood, so JS Date / Intl.DateTimeFormat / getTimezoneOffset all
+  return values consistent with the profile's IANA id.
+
+Verified on profile B with timezone = 'Asia/Tokyo':
+  navigator.webdriver                              -> false
+  new Date().getTimezoneOffset()                   -> -540
+  Intl.DateTimeFormat().resolvedOptions().timeZone -> 'Asia/Tokyo'
+  new Date().toString()                            -> '... GMT+0900
+                                                       (Japan
+                                                       Standard
+                                                       Time)'
+
+Files touched:
+- chrome/common/chrome_switches.{h,cc}                 (kFingerprintTimezone)
+- chrome/browser/fingerprint/fingerprint_profile.{h,cc} (Timezone)
+- chrome/browser/chrome_content_browser_client.cc      (append switch)
+- chrome/renderer/chrome_content_renderer_client.cc    (parse + mirror)
+- third_party/blink/renderer/platform/fingerprint/
+    fingerprint_state.{h,cc}                           (SetTimezone/Timezone)
+- third_party/blink/renderer/core/frame/navigator.cc   (webdriver = false)
+- third_party/blink/renderer/core/timezone/
+    timezone_controller.cc                             (install override in Init)
+---
+ .../browser/chrome_content_browser_client.cc  |  4 +++
+ .../fingerprint/fingerprint_profile.cc        |  8 ++++++
+ .../browser/fingerprint/fingerprint_profile.h |  3 ++
+ chrome/common/chrome_switches.cc              |  1 +
+ chrome/common/chrome_switches.h               |  3 ++
+ .../chrome_content_renderer_client.cc         |  5 ++++
+ .../blink/renderer/core/frame/navigator.cc    |  6 ++++
+ .../core/timezone/timezone_controller.cc      | 28 +++++++++++++++++++
+ .../platform/fingerprint/fingerprint_state.cc | 23 +++++++++++++++
+ .../platform/fingerprint/fingerprint_state.h  |  4 +++
+ 10 files changed, 85 insertions(+)
+
+diff --git a/chrome/browser/chrome_content_browser_client.cc b/chrome/browser/chrome_content_browser_client.cc
+index 6fb3344b4fd6e..b4807537b5f99 100644
+--- a/chrome/browser/chrome_content_browser_client.cc
++++ b/chrome/browser/chrome_content_browser_client.cc
+@@ -2851,6 +2851,10 @@ void ChromeContentBrowserClient::AppendExtraCommandLineSwitches(
+         command_line->AppendSwitchASCII(switches::kFingerprintAcceptLanguage,
+                                         accept_lang);
+       }
++      const std::string tz = fp->Timezone();
++      if (!tz.empty()) {
++        command_line->AppendSwitchASCII(switches::kFingerprintTimezone, tz);
++      }
+     }
+   }
+ #if BUILDFLAG(IS_MAC)
+diff --git a/chrome/browser/fingerprint/fingerprint_profile.cc b/chrome/browser/fingerprint/fingerprint_profile.cc
+index 4468633faacbc..77f00137c6569 100644
+--- a/chrome/browser/fingerprint/fingerprint_profile.cc
++++ b/chrome/browser/fingerprint/fingerprint_profile.cc
+@@ -177,6 +177,14 @@ std::string FingerprintProfile::WebRtcPolicyValue() const {
+   return {};
+ }
+ 
++std::string FingerprintProfile::Timezone() const {
++  if (!loaded_) {
++    return {};
++  }
++  const std::string* s = dict_.FindString("timezone");
++  return s ? *s : std::string();
++}
++
+ std::string FingerprintProfile::AcceptLanguageCsv() const {
+   if (!loaded_) {
+     return {};
+diff --git a/chrome/browser/fingerprint/fingerprint_profile.h b/chrome/browser/fingerprint/fingerprint_profile.h
+index cb9a3b2add1a4..73ba5b4e5eb9b 100644
+--- a/chrome/browser/fingerprint/fingerprint_profile.h
++++ b/chrome/browser/fingerprint/fingerprint_profile.h
+@@ -91,6 +91,9 @@ class FingerprintProfile : public chrome::mojom::FingerprintConfigProvider {
+   // Accept-Language header / navigator.languages comma-list. Empty = none.
+   std::string AcceptLanguageCsv() const;
+ 
++  // IANA timezone id. Empty = none.
++  std::string Timezone() const;
++
+  private:
+   friend class base::NoDestructor<FingerprintProfile>;
+   FingerprintProfile();
+diff --git a/chrome/common/chrome_switches.cc b/chrome/common/chrome_switches.cc
+index 7f66f096afec3..17765b5649c38 100644
+--- a/chrome/common/chrome_switches.cc
++++ b/chrome/common/chrome_switches.cc
+@@ -368,6 +368,7 @@ const char kFingerprintHardware[] = "fingerprint-hardware";
+ const char kFingerprintBattery[] = "fingerprint-battery";
+ const char kFingerprintWebRtcPolicy[] = "fingerprint-webrtc-policy";
+ const char kFingerprintAcceptLanguage[] = "fingerprint-accept-language";
++const char kFingerprintTimezone[] = "fingerprint-timezone";
+ 
+ // Does not show the crash restore bubble when the browser is started during the
+ // system startup phase in ChromeOS, if the ChromeOS full restore feature is
+diff --git a/chrome/common/chrome_switches.h b/chrome/common/chrome_switches.h
+index 5792fe4f4c6e9..91ce43aac5e7a 100644
+--- a/chrome/common/chrome_switches.h
++++ b/chrome/common/chrome_switches.h
+@@ -163,6 +163,9 @@ extern const char kFingerprintWebRtcPolicy[];
+ // Comma-separated list, e.g. "en-US,en".
+ extern const char kFingerprintAcceptLanguage[];
+ 
++// Chronium (internal): IANA timezone override, e.g. "America/New_York".
++extern const char kFingerprintTimezone[];
++
+ extern const char kHideCrashRestoreBubble[];
+ extern const char kHomePage[];
+ #if !BUILDFLAG(IS_ANDROID)
+diff --git a/chrome/renderer/chrome_content_renderer_client.cc b/chrome/renderer/chrome_content_renderer_client.cc
+index d19f6021cf158..3af0e8877c482 100644
+--- a/chrome/renderer/chrome_content_renderer_client.cc
++++ b/chrome/renderer/chrome_content_renderer_client.cc
+@@ -474,6 +474,11 @@ void ChromeContentRendererClient::RenderThreadStarted() {
+     if (!accept_lang.empty()) {
+       blink::FingerprintState::SetAcceptLanguage(accept_lang);
+     }
++    const std::string tz =
++        cmd_line->GetSwitchValueASCII(switches::kFingerprintTimezone);
++    if (!tz.empty()) {
++      blink::FingerprintState::SetTimezone(tz);
++    }
+   }
+ 
+   main_thread_profiler_->SetAuxUnwinderFactory(base::BindRepeating(
+diff --git a/third_party/blink/renderer/core/frame/navigator.cc b/third_party/blink/renderer/core/frame/navigator.cc
+index 806af2d1d9149..d9fe1aa2e6c41 100644
+--- a/third_party/blink/renderer/core/frame/navigator.cc
++++ b/third_party/blink/renderer/core/frame/navigator.cc
+@@ -104,6 +104,12 @@ bool Navigator::cookieEnabled() const {
+ }
+ 
+ bool Navigator::webdriver() const {
++  // Chronium: always false. Plan §5 #18 "CDP hide webdriver". Real Chrome
++  // user sessions return false; fingerprinters use any true value as a
++  // hard automation signal regardless of UA / fingerprint coherence.
++  if (FingerprintState::IsActive()) {
++    return false;
++  }
+   if (RuntimeEnabledFeatures::AutomationControlledEnabled())
+     return true;
+ 
+diff --git a/third_party/blink/renderer/core/timezone/timezone_controller.cc b/third_party/blink/renderer/core/timezone/timezone_controller.cc
+index 48eb8d2fbdcf5..8ab8c976182d8 100644
+--- a/third_party/blink/renderer/core/timezone/timezone_controller.cc
++++ b/third_party/blink/renderer/core/timezone/timezone_controller.cc
+@@ -11,8 +11,10 @@
+ #include "third_party/blink/public/platform/platform.h"
+ #include "third_party/blink/public/platform/task_type.h"
+ #include "third_party/blink/public/web/web_local_frame.h"
++#include "base/command_line.h"
+ #include "third_party/blink/renderer/core/dom/events/event.h"
+ #include "third_party/blink/renderer/core/frame/frame.h"
++#include "third_party/blink/renderer/platform/fingerprint/fingerprint_state.h"
+ #include "third_party/blink/renderer/core/frame/local_dom_window.h"
+ #include "third_party/blink/renderer/core/frame/local_frame.h"
+ #include "third_party/blink/renderer/core/page/page.h"
+@@ -109,6 +111,32 @@ void TimeZoneController::Init() {
+   Platform::Current()->GetBrowserInterfaceBroker()->GetInterface(
+       monitor.BindNewPipeAndPassReceiver());
+   monitor->AddClient(instance().receiver_.BindNewPipeAndPassRemote());
++
++  // Chronium: install per-profile timezone via the same RAII handle DevTools
++  // emulation uses. We must read the switch directly from the command line
++  // because Init() runs from CoreInitializer (called by InitializeWebKit in
++  // RenderThreadImpl) BEFORE ChromeContentRendererClient::RenderThreadStarted
++  // has had a chance to populate blink::FingerprintState. The command line
++  // itself is set at process spawn, so it's available here.
++  static constexpr char kFingerprintTimezoneSwitch[] = "fingerprint-timezone";
++  const base::CommandLine* cmd_line = base::CommandLine::ForCurrentProcess();
++  if (cmd_line && cmd_line->HasSwitch(kFingerprintTimezoneSwitch)) {
++    const std::string tz =
++        cmd_line->GetSwitchValueASCII(kFingerprintTimezoneSwitch);
++    if (!tz.empty()) {
++      auto result = SetTimeZoneOverride(String(tz));
++      if (result.status == TimeZoneOverrideStatus::kSuccess && result.handle) {
++        // Intentional leak: the override should persist for the renderer's
++        // lifetime, and the handle has trivial state (RAII clears override
++        // on destruction, which we explicitly do NOT want here).
++        [[maybe_unused]] auto* leaked = result.handle.release();
++      }
++      // Make sure FingerprintState reflects what we installed; other patches
++      // may consume it via the typed accessor (e.g. for matching
++      // navigator.timeZone reads added later).
++      FingerprintState::SetTimezone(tz);
++    }
++  }
+ }
+ 
+ // static
+diff --git a/third_party/blink/renderer/platform/fingerprint/fingerprint_state.cc b/third_party/blink/renderer/platform/fingerprint/fingerprint_state.cc
+index 90edcf8e1c7f4..8dd88ce1ee309 100644
+--- a/third_party/blink/renderer/platform/fingerprint/fingerprint_state.cc
++++ b/third_party/blink/renderer/platform/fingerprint/fingerprint_state.cc
+@@ -45,6 +45,12 @@ std::string& AcceptLanguageStorage() {
+ }
+ std::atomic<bool> g_accept_language_set{false};
+ 
++std::string& TimezoneStorage() {
++  static base::NoDestructor<std::string> s;
++  return *s;
++}
++std::atomic<bool> g_timezone_set{false};
++
+ FingerprintState::ScreenFp& ScreenStorage() {
+   // POD with trivial destructor — base::NoDestructor would static-assert.
+   static FingerprintState::ScreenFp s;
+@@ -179,6 +185,23 @@ std::string_view FingerprintState::AcceptLanguage() {
+   return AcceptLanguageStorage();
+ }
+ 
++// static
++void FingerprintState::SetTimezone(std::string_view value) {
++  if (g_timezone_set.load(std::memory_order_acquire) || value.empty()) {
++    return;
++  }
++  TimezoneStorage().assign(value);
++  g_timezone_set.store(true, std::memory_order_release);
++}
++
++// static
++std::string_view FingerprintState::Timezone() {
++  if (!g_timezone_set.load(std::memory_order_acquire)) {
++    return {};
++  }
++  return TimezoneStorage();
++}
++
+ // static
+ void FingerprintState::SetScreen(const ScreenFp& screen) {
+   if (g_screen_set.load(std::memory_order_acquire) || screen.width <= 0 ||
+diff --git a/third_party/blink/renderer/platform/fingerprint/fingerprint_state.h b/third_party/blink/renderer/platform/fingerprint/fingerprint_state.h
+index 292321f8a93ed..4377bdd314bc6 100644
+--- a/third_party/blink/renderer/platform/fingerprint/fingerprint_state.h
++++ b/third_party/blink/renderer/platform/fingerprint/fingerprint_state.h
+@@ -50,6 +50,10 @@ class PLATFORM_EXPORT FingerprintState {
+   static void SetAcceptLanguage(std::string_view value);
+   static std::string_view AcceptLanguage();
+ 
++  // IANA timezone id, e.g. "America/New_York". Empty = no override.
++  static void SetTimezone(std::string_view value);
++  static std::string_view Timezone();
++
+   // Empty when no override is in effect.
+   static std::string_view WebGLUnmaskedVendor();
+   static std::string_view WebGLUnmaskedRenderer();
+-- 
+2.54.0.windows.1
+

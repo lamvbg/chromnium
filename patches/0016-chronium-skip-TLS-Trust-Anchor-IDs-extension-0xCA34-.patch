@@ -1,0 +1,87 @@
+From 72f0aa968d3dd53bbb0e399ef911d593b3dc1c31 Mon Sep 17 00:00:00 2001
+From: Chronium <chronium@interlink.local>
+Date: Mon, 8 Jun 2026 18:09:15 +0700
+Subject: [PATCH] chronium: skip TLS Trust Anchor IDs extension (0xCA34) for
+ JA4 parity with Chrome stable
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The dev build was emitting an extra ClientHello extension at codepoint
+0xCA34 (TLSEXT_TYPE_trust_anchors) with empty data 0x0000, shifting JA4
+from t13d1516h2 (Chrome stable) to t13d1517h2 (dev build) and changing
+both the JA4 and peetprint hashes. That mismatch alone is enough for
+Cloudflare Bot Management Premium (grok.com) to refuse the connection
+regardless of how good the in-browser fingerprint patches are.
+
+Root cause: features::kTLSTrustAnchorIDs is FEATURE_DISABLED_BY_DEFAULT,
+but ssl_config_.trust_anchor_ids ends up an empty-valued optional through
+the DNS service-endpoint path, so the has_value() check at line 849 fires
+and BoringSSL serializes the extension with a zero-length body. Real
+Chrome on the same tag stays at nullopt for this field on typical hosts.
+
+Fix: cut the SSL_set1_requested_trust_anchors call at the TCP/HTTP-2
+site. (Companion QUIC site at
+net/third_party/quiche/src/quiche/quic/core/tls_client_handshaker.cc
+lives in a submodule and is patched separately in the working tree.)
+
+Verified after rebuild via https://tls.peet.ws/api/all (no sidecar,
+no proxy, direct from chronium.exe):
+  ja4                      t13d1516h2_8daaf6152771_d8a2da3f94cd  (Chrome 149 stable)
+  akamai_fingerprint_hash  52d84b11737d980aef856699f885ca86      (matches)
+  peetprint_hash           1d4ffe9b0e34acac0bd883fa7f79d7b5      (matches)
+  Unknown extension 51764  GONE
+  ja4_r ext list           ...0033,44cd,fe0d,ff01 (16 ext, ca34 removed)
+
+This eliminates the need for the curl_cffi mitmproxy sidecar on most
+paths — chronium can go direct and still pass standard Cloudflare gates.
+Sidecar remains useful for chaining residential/mobile proxies for
+IP-reputation-gated sites.
+---
+ net/socket/ssl_client_socket_impl.cc | 30 +++++++++++++++-------------
+ 1 file changed, 16 insertions(+), 14 deletions(-)
+
+diff --git a/net/socket/ssl_client_socket_impl.cc b/net/socket/ssl_client_socket_impl.cc
+index 8ac44772109a8..279997ea6b787 100644
+--- a/net/socket/ssl_client_socket_impl.cc
++++ b/net/socket/ssl_client_socket_impl.cc
+@@ -845,20 +845,22 @@ int SSLClientSocketImpl::Init() {
+ 
+   SSL_set_permute_extensions(ssl_.get(), 1);
+ 
+-  // Configure BoringSSL to send Trust Anchor IDs, if provided.
+-  if (ssl_config_.trust_anchor_ids.has_value()) {
+-    if (!SSL_set1_requested_trust_anchors(
+-            ssl_.get(), ssl_config_.trust_anchor_ids->data(),
+-            ssl_config_.trust_anchor_ids->size())) {
+-      return ERR_UNEXPECTED;
+-    }
+-    net_log_.AddEvent(NetLogEventType::SSL_CLIENT_TRUST_ANCHOR_IDS_LIST, [&] {
+-      return base::DictValue().Set(
+-          "trust_anchor_ids",
+-          x509_util::TrustAnchorIDsToString(x509_util::ParseTlsTrustAnchorIDs(
+-              *ssl_config_.trust_anchor_ids)));
+-    });
+-  }
++  // Chronium: NEVER send the TLS Trust Anchor IDs extension (0xCA34 /
++  // TLSEXT_TYPE_trust_anchors). Real Chrome stable on this same tag does
++  // not emit it for typical HTTPS hosts; our dev build calls
++  // SSL_set1_requested_trust_anchors with an empty list anyway, which
++  // makes BoringSSL emit `extension(0xCA34) data=0000`. That extra byte
++  // pair turns up in JA4 as `ca34` and shifts the JA4 hash off the real
++  // Chrome value — Cloudflare Bot Management Premium (grok.com) refuses
++  // the connection on that mismatch alone. Drop the call wholesale; we
++  // don't rely on server-side trust anchor selection in any of the
++  // protected workflows.
++  // Original guarded block kept commented for diff-tracking against
++  // upstream:
++  //   if (ssl_config_.trust_anchor_ids.has_value()) {
++  //     if (!SSL_set1_requested_trust_anchors(...)) return ERR_UNEXPECTED;
++  //     net_log_.AddEvent(...);
++  //   }
+ 
+   // The compliance policy must be the last thing configured in order to have
+   // defined behavior.
+-- 
+2.54.0.windows.1
+
