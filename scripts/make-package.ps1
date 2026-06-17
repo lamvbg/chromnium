@@ -104,11 +104,24 @@ if ($encCount -gt 0) {
     Write-Host ("    {0} plaintext profiles copied" -f $plainCount)
 }
 
-# --- Copy scripts (PowerShell only — no Python required) ---
-Write-Host "[4/6] Copying PowerShell scripts..." -ForegroundColor Cyan
+# --- Copy scripts ---
+# Bundle the PowerShell launcher pair (back-compat with the old "no
+# Python required" zip) plus the three Python helpers that drive the
+# DRM-aware standalone flow: decrypt-profile.py (AES-GCM decrypt +
+# optional auto-localize), gen-debug-token.py (per-launch HMAC token),
+# encrypt-profiles.py (kept so a dev with .profile_key can re-encrypt
+# after editing a JSON in-place).
+Write-Host "[4/6] Copying scripts..." -ForegroundColor Cyan
 $ScriptsDst = Join-Path $Staging 'scripts'
 New-Item -ItemType Directory -Path $ScriptsDst -Force | Out-Null
-foreach ($f in @('chronium.ps1', 'prepare-profile.ps1')) {
+$scriptsToShip = @(
+    'chronium.ps1',
+    'prepare-profile.ps1',
+    'decrypt-profile.py',
+    'gen-debug-token.py',
+    'encrypt-profiles.py'
+)
+foreach ($f in $scriptsToShip) {
     $src = Join-Path $ScriptDir $f
     if (-not (Test-Path $src)) {
         Write-Warning "Missing $f at $src"
