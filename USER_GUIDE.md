@@ -73,52 +73,58 @@ Bạn cần có:
 3. **Python 3** + script `gen-debug-token.py` từ repo `chromnium`
 4. **Fingerprint JSON plaintext**: hoặc có sẵn `example-profile.json` trong chronium-build, hoặc decrypt một file `.json.enc` từ release zip
 
-### Bước 1: Generate license token
+### ⚠️ Đặt biến PowerShell
+
+**KHÔNG dùng `$args`** — đó là biến reserved của PowerShell, assign vào sẽ silent fail. Dùng `$tokenArgs` hoặc tên khác.
+
+### Bước 1: Decrypt một fingerprint JSON sang file tạm
+
+```powershell
+# Cài cryptography (1 lần)
+pip install cryptography
+
+# Decrypt win-rtx2000 → temp file, in path ra để capture
+$CHRONIUM = 'C:\Users\Admin\Desktop\Interlink\chronium-build'
+$plainFile = python $CHRONIUM\scripts\decrypt-profile.py win-rtx2000 --to-temp
+Write-Host "Plaintext: $plainFile"
+```
+
+Output mẫu: `Plaintext: C:\Users\Admin\AppData\Local\Temp\chronium-win-rtx2000-xyz.json` (9 KB JSON đầy đủ).
+
+### Bước 2: Generate license token
 
 Token bind vào PID của terminal hiện tại — phải gen + launch chrome trong **CÙNG** PowerShell window.
 
 ```powershell
-# Gen token bound to this shell's PID ($PID auto-resolve)
-$args = python C:\path\to\chronium-build\scripts\gen-debug-token.py --ppid $PID
-
-Write-Host "Token args: $args"
-# Output sample: --license-ts=1781684793 --license-nonce=abc... --license-token=def...
+$tokenArgs = python $CHRONIUM\scripts\gen-debug-token.py --ppid $PID
+Write-Host "Token: $tokenArgs"
+# Output: --license-ts=... --license-nonce=... --license-token=...
 ```
-
-### Bước 2: Decrypt một fingerprint JSON
-
-Nếu bạn chỉ có `.json.enc` từ release zip:
-
-```powershell
-# Decrypt test (yêu cầu Python + cryptography)
-pip install cryptography
-python C:\path\to\chronium-build\scripts\encrypt-profiles.py `
-    --decrypt-test win-rtx2000
-
-# Hoặc tự script decrypt rồi save plaintext
-```
-
-Hoặc dùng sẵn `example-profile.json` trong repo (plaintext, đã tracked).
 
 ### Bước 3: Launch chrome.exe
 
 ```powershell
-# Tạo user-data-dir riêng
-$udd = "C:\tmp\chronium-test"
+$udd = "$env:TEMP\chronium-test-$(Get-Random)"
 New-Item -ItemType Directory -Force -Path $udd | Out-Null
 
-# Launch
-& "C:\path\to\extracted\bin\chrome.exe" `
-    --user-data-dir=$udd `
-    --no-first-run `
-    --no-default-browser-check `
-    --use-angle=d3d11 `
-    --fingerprint-profile="C:\path\to\decrypted-profile.json" `
-    ($args -split ' ') `
-    https://iphey.com
+$chrome = 'C:\work\antidetect\vendor\chronium\bin\chrome.exe'   # hoặc path zip giải nén của bạn
+
+$launchArgs = @(
+    "--user-data-dir=$udd",
+    '--no-first-run',
+    '--no-default-browser-check',
+    '--use-angle=d3d11',
+    "--fingerprint-profile=$plainFile"
+) + ($tokenArgs -split ' ') + @('https://iphey.com')
+
+& $chrome @launchArgs
 ```
 
-→ Browser mở. Nếu thấy chrome.exe tắt ngay → token sai PPID (chắc chắn dùng `--ppid $PID` trong cùng terminal).
+→ Browser mở vào iphey.com. Nếu chrome.exe tắt ngay → check 3 thứ:
+
+1. **`$tokenArgs` rỗng?** → vẫn dùng `$args` (đổi tên!)
+2. **`$plainFile` không tồn tại?** → check `Get-Item $plainFile`
+3. **Different terminal?** → mở chrome ở terminal khác sẽ fail vì PPID khác
 
 ### Bước 4: Verify
 
@@ -135,33 +141,45 @@ Trong browser vừa mở:
 
 ### Wrapper script tiện cho dev
 
-Lưu thành `launch-chrome.ps1`:
+Lưu thành `launch-chrome.ps1` (cần `$CHRONIUM` + `$BIN` chỉnh path tới máy bạn):
 
 ```powershell
-# launch-chrome.ps1 - one-shot chronium launch with fresh token
+# launch-chrome.ps1 - one-shot chronium launch with fresh token + decrypted profile
 param(
-    [string]$Profile = "C:\path\to\example-profile.json",
-    [string]$Url = "https://iphey.com",
+    [string]$Fingerprint = 'win-rtx2000',
+    [string]$Url = 'https://iphey.com',
     [string]$Udd = "$env:TEMP\chronium-dev-$(Get-Random)"
 )
-$root = "C:\Users\Admin\Desktop\Interlink\chronium-build"
-$binDir = "C:\path\to\extracted\bin"  # OR vendor/chronium/bin/ in antidetect dev
+$CHRONIUM = 'C:\Users\Admin\Desktop\Interlink\chronium-build'
+$BIN      = 'C:\work\antidetect\vendor\chronium\bin'
 
-$tokenArgs = python "$root\scripts\gen-debug-token.py" --ppid $PID
+# Decrypt fingerprint to temp plaintext
+$plain = python "$CHRONIUM\scripts\decrypt-profile.py" $Fingerprint --to-temp
+if (-not $plain) { Write-Error "decrypt failed"; exit 1 }
+
+# Gen license token bound to current shell
+$tokenArgs = python "$CHRONIUM\scripts\gen-debug-token.py" --ppid $PID
 if (-not $tokenArgs) { Write-Error "token gen failed"; exit 1 }
 
+# Launch
 New-Item -ItemType Directory -Force -Path $Udd | Out-Null
-& "$binDir\chrome.exe" `
-    --user-data-dir=$Udd `
-    --no-first-run `
-    --no-default-browser-check `
-    --use-angle=d3d11 `
-    --fingerprint-profile=$Profile `
-    ($tokenArgs -split ' ') `
-    $Url
+$args = @(
+    "--user-data-dir=$Udd",
+    '--no-first-run',
+    '--no-default-browser-check',
+    '--use-angle=d3d11',
+    "--fingerprint-profile=$plain"
+) + ($tokenArgs -split ' ') + @($Url)
+
+& "$BIN\chrome.exe" @args
 ```
 
-Dùng: `.\launch-chrome.ps1 -Url https://google.com`
+Dùng:
+```powershell
+.\launch-chrome.ps1                                   # default: win-rtx2000 -> iphey.com
+.\launch-chrome.ps1 -Fingerprint win-amd-000015e7     # khác GPU
+.\launch-chrome.ps1 -Url https://creepjs.com          # khác target
+```
 
 ---
 

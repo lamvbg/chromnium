@@ -8,22 +8,20 @@ end-user never sees it; this script is for the rare developer case
 where you want to run chrome.exe directly with no app, e.g. iterating
 on a patch and checking startup behavior in-tree.
 
-Important: the token binds to the CURRENT PROCESS'S PID. The process
-that runs chrome.exe must have PID == the PID we used here, which means
-this script must be invoked in the same shell from which chrome.exe is
-launched. Example:
+Important: the token binds to the parent PID you pass via ``--ppid``. The
+process that ACTUALLY spawns chrome.exe must have THAT pid (else the
+gate rejects). For interactive PowerShell sessions, pass --ppid $PID and
+launch chrome from the same window:
 
-    PS> $args = (python scripts\gen-debug-token.py) -split " "
-    PS> & C:\\cr\\src\\out\\Release\\chrome.exe `
-            --user-data-dir=C:\\tmp\\debug `
-            --fingerprint-profile=C:\\path\\to\\plaintext.json `
-            $args `
+    PS> $tokenArgs = python scripts/gen-debug-token.py --ppid $PID
+    PS> & C:/cr/src/out/Release/chrome.exe `
+            --user-data-dir=C:/tmp/debug `
+            --fingerprint-profile=C:/path/plaintext.json `
+            ($tokenArgs -split ' ') `
             https://iphey.com
 
-If you open a new shell between the two commands, the PID changes and
-the gate will (correctly) reject the token. Add --bypass-ppid to skip
-the ppid binding when you only need to smoke-test startup; this only
-works on debug builds where the gate honors the bypass flag.
+Note: do NOT use the variable name $args -- it is a PowerShell reserved
+automatic variable. Use $tokenArgs or any other name.
 """
 
 from __future__ import annotations
