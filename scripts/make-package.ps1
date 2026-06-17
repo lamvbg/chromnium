@@ -79,12 +79,30 @@ $fileCount = (Get-ChildItem $BinDir -Recurse -File).Count
 Write-Host "    bin/ size: $([math]::Round($binSize,1)) MB ($fileCount files)"
 
 # --- Copy fingerprint profiles ---
-Write-Host "[3/6] Copying 170 fingerprint profiles..." -ForegroundColor Cyan
+# Ship the AES-GCM encrypted .json.enc variants only — see
+# scripts/encrypt-profiles.py + backend/app/engine/license.py. A user who
+# extracts the zip without the matching CHRONIUM_LICENSE_KEY can't read
+# any fingerprint, so the bin/ folder is useless even if they bypass the
+# Layer-1 HMAC gate (DRM defense in depth).
+#
+# If .json.enc is missing from the source tree, the dev forgot to run
+# encrypt-profiles.py; fall back to plaintext .json with a loud warning
+# so packaging still works during the v0.1.2 -> v0.1.3 transition.
+Write-Host "[3/6] Copying encrypted fingerprint profiles..." -ForegroundColor Cyan
 $ProfilesDst = Join-Path $Staging 'config\profiles'
 New-Item -ItemType Directory -Path $ProfilesDst -Force | Out-Null
-Copy-Item -Path "$ProfilesSrc\*.json" -Destination $ProfilesDst -Force
-$profileCount = (Get-ChildItem $ProfilesDst -Filter *.json).Count
-Write-Host "    $profileCount profiles copied"
+
+$encCount = (Get-ChildItem $ProfilesSrc -Filter '*.json.enc' -ErrorAction SilentlyContinue).Count
+if ($encCount -gt 0) {
+    Copy-Item -Path "$ProfilesSrc\*.json.enc" -Destination $ProfilesDst -Force
+    Write-Host ("    {0} encrypted profiles copied (.json.enc)" -f $encCount)
+} else {
+    Write-Warning ("No .json.enc found at {0}. Run scripts/encrypt-profiles.py first." -f $ProfilesSrc)
+    Write-Warning "Falling back to plaintext .json - the release will NOT be DRM-protected."
+    Copy-Item -Path "$ProfilesSrc\*.json" -Destination $ProfilesDst -Force
+    $plainCount = (Get-ChildItem $ProfilesDst -Filter '*.json').Count
+    Write-Host ("    {0} plaintext profiles copied" -f $plainCount)
+}
 
 # --- Copy scripts (PowerShell only — no Python required) ---
 Write-Host "[4/6] Copying PowerShell scripts..." -ForegroundColor Cyan

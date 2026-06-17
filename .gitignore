@@ -4,6 +4,18 @@ release/
 # rcedit and similar third-party tools — fetched per-machine
 tools/*.exe
 
+# License secret artifacts — must NEVER be committed. gen-license-secret.py
+# writes .profile_key here and the .h sibling lives in the chromium fork
+# checkout (we keep a defensive line for it too in case the repo path
+# changes). Plaintext profile JSONs stay tracked in this source repo for
+# dev convenience; the release-zip packager (make-package.ps1) is what
+# decides to ship .json.enc instead.
+config/.profile_key
+include/license_secret.h
+# Encrypted release artifacts — produced by encrypt-profiles.py from the
+# tracked plaintext JSONs. Re-derivable; don't pollute git history.
+config/profiles/*.json.enc
+
 # OS junk
 Thumbs.db
 desktop.ini

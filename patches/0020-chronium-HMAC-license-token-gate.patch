@@ -1,0 +1,334 @@
+From fd70b0e82d00a41937b0c5761a5c727f0735ff92 Mon Sep 17 00:00:00 2001
+From: Chronium <chronium@interlink.local>
+Date: Wed, 17 Jun 2026 15:53:32 +0700
+Subject: [PATCH] chronium: HMAC license-token gate (patch 0020)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Refuse to start without a valid --license-{ts,nonce,token} triple from
+the launcher. Defends against extraction of bin/ + DLLs to a different
+machine: a pirate who copies the binary off an installed antidetect can
+no longer run chrome.exe standalone.
+
+How it works (validated in chrome_browser_main.cc, very early — before
+the FingerprintProfile load and any UI):
+
+  token == HMAC_SHA256(BAKED_SECRET, "<ts>|<ppid>" || nonce)[:16]
+  abs(now - ts) <= 60 seconds
+  ppid == GetParentProcessId(GetCurrentProcessHandle())
+
+All three checks gate. On any failure call std::_Exit(0) — silent
+close that looks like a normal crash to the pirate; nothing in the log
+hints we explicitly rejected them.
+
+Files:
+  chrome/browser/license/license_gate.{h,cc} (new)
+  chrome/browser/license/license_secret.h (gitignored — git/info/exclude;
+    written by chronium-build/scripts/gen-license-secret.py)
+  chrome/browser/chrome_browser_main.cc: EnforceLicenseGate() call
+    inserted above the FingerprintProfile loader at line ~1219.
+  chrome/browser/BUILD.gn: add license_gate.{h,cc,_secret.h} to chrome
+    target sources.
+  chrome/common/chrome_switches.{h,cc}: declare kLicenseTs / kLicenseNonce
+    / kLicenseToken.
+
+Pairs with chrome/browser/fingerprint/fingerprint_profile.cc which
+already loads the per-launch fingerprint JSON; we now also encrypt the
+JSON itself in the launcher and decrypt before that load, so even if
+the gate is somehow bypassed, the fingerprint library stays opaque
+without the secret. See antidetect/backend/app/engine/license.py and
+chronium-build/scripts/encrypt-profiles.py for the launcher side.
+
+BoringSSL HMAC_SHA256 was already linked — no new deps. Token compares
+in constant time (span-based ConstantTimeEqual) to avoid timing
+side-channels.
+---
+ chrome/browser/BUILD.gn                |   3 +
+ chrome/browser/chrome_browser_main.cc  |   8 ++
+ chrome/browser/license/license_gate.cc | 158 +++++++++++++++++++++++++
+ chrome/browser/license/license_gate.h  |  29 +++++
+ chrome/common/chrome_switches.cc       |   3 +
+ chrome/common/chrome_switches.h        |  11 ++
+ 6 files changed, 212 insertions(+)
+ create mode 100644 chrome/browser/license/license_gate.cc
+ create mode 100644 chrome/browser/license/license_gate.h
+
+diff --git a/chrome/browser/BUILD.gn b/chrome/browser/BUILD.gn
+index c923a67815459..ac5d838f41e0c 100644
+--- a/chrome/browser/BUILD.gn
++++ b/chrome/browser/BUILD.gn
+@@ -3471,6 +3471,9 @@ static_library("browser") {
+       "enterprise/signals/device_info_fetcher.h",
+       "fingerprint/fingerprint_profile.cc",
+       "fingerprint/fingerprint_profile.h",
++      "license/license_gate.cc",
++      "license/license_gate.h",
++      "license/license_secret.h",
+       "first_run/bookmark_importer.cc",
+       "first_run/bookmark_importer.h",
+       "first_run/first_run.cc",
+diff --git a/chrome/browser/chrome_browser_main.cc b/chrome/browser/chrome_browser_main.cc
+index 7ae1e24ebb3a2..f685023b62a45 100644
+--- a/chrome/browser/chrome_browser_main.cc
++++ b/chrome/browser/chrome_browser_main.cc
+@@ -39,6 +39,7 @@
+ #include "chrome/browser/enterprise/browser_management/management_service_factory.h"
+ #include "chrome/browser/enterprise/chrome_browser_main_extra_parts_enterprise.h"
+ #include "chrome/browser/fingerprint/fingerprint_profile.h"
++#include "chrome/browser/license/license_gate.h"
+ #include "chrome/browser/first_run/bookmark_importer.h"
+ // IWYU pragma: keep — embedder_support/switches.h provides kUserAgent.
+ #include "components/embedder_support/switches.h"
+@@ -1210,6 +1211,13 @@ int ChromeBrowserMainParts::PreCreateThreadsImpl() {
+ 
+   DCHECK(!user_data_dir_.empty());
+ 
++  // Chronium: enforce the per-launch HMAC license gate BEFORE we touch
++  // the fingerprint config or anything else. If the launcher didn't pass
++  // a fresh valid (ts, nonce, token) triple, EnforceLicenseGate() calls
++  // _Exit(0) and does not return. Pirates running chrome.exe directly
++  // (no antidetect launcher) end up here and silently exit.
++  chronium::EnforceLicenseGate();
++
+   // Chronium: load per-profile fingerprint config from
+   // --fingerprint-profile=<path> as early as possible so all downstream
+   // singletons see it. Missing/malformed file is non-fatal — patches fall
+diff --git a/chrome/browser/license/license_gate.cc b/chrome/browser/license/license_gate.cc
+new file mode 100644
+index 0000000000000..6b8bc20211870
+--- /dev/null
++++ b/chrome/browser/license/license_gate.cc
+@@ -0,0 +1,158 @@
++// Copyright 2026 The Chronium Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license.
++
++#include "chrome/browser/license/license_gate.h"
++
++#include <cstdint>
++#include <cstdlib>
++#include <ctime>
++#include <string>
++#include <string_view>
++
++#include "base/command_line.h"
++#include "base/containers/span.h"
++#include "base/process/process_handle.h"
++#include "base/strings/string_number_conversions.h"
++#include "chrome/browser/license/license_secret.h"
++#include "chrome/common/chrome_switches.h"
++#include "third_party/boringssl/src/include/openssl/hmac.h"
++
++namespace chronium {
++
++namespace {
++
++// 60-second drift allowance — launchers and chronium have to agree on
++// wall-clock time within this window. Picked to cover NTP slew + slow
++// disk-cold-start launches; tightening it further makes legitimate
++// launches racy on under-spec'd Windows boxes.
++constexpr int64_t kMaxClockDriftSeconds = 60;
++
++// Truncated HMAC tag length we compare against. The HMAC itself is 32
++// bytes; we ship the first 16 to keep the cmdline shorter. 128-bit
++// truncated HMAC is the standard practice (RFC 2104 §5) and still gives
++// 128 bits of forgery resistance.
++constexpr size_t kTokenLen = 16;
++
++// Decode an even-length lowercase-hex string into raw bytes. Returns
++// false on any malformed character; we treat malformed inputs as gate
++// failures rather than crashing.
++bool HexDecode(std::string_view hex, std::vector<uint8_t>* out) {
++  if (hex.size() % 2 != 0) {
++    return false;
++  }
++  out->resize(hex.size() / 2);
++  for (size_t i = 0; i < out->size(); ++i) {
++    auto nibble = [](char c) -> int {
++      if (c >= '0' && c <= '9') return c - '0';
++      if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
++      if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
++      return -1;
++    };
++    int hi = nibble(hex[i * 2]);
++    int lo = nibble(hex[i * 2 + 1]);
++    if (hi < 0 || lo < 0) {
++      return false;
++    }
++    (*out)[i] = static_cast<uint8_t>((hi << 4) | lo);
++  }
++  return true;
++}
++
++// Constant-time compare to keep the gate insensitive to side-channel
++// timing analysis. Same shape as boringssl's CRYPTO_memcmp — we keep an
++// in-line copy so callers don't have to plumb the header.
++bool ConstantTimeEqual(base::span<const uint8_t> a,
++                       base::span<const uint8_t> b) {
++  if (a.size() != b.size()) {
++    return false;
++  }
++  uint8_t diff = 0;
++  for (size_t i = 0; i < a.size(); ++i) {
++    diff |= static_cast<uint8_t>(a[i] ^ b[i]);
++  }
++  return diff == 0;
++}
++
++// Compute HMAC-SHA256(kLicenseSecret, msg) truncated to kTokenLen. Used
++// twice — once here to verify the launcher's token, and once in debug
++// builds via the gen-debug-token tool for symmetry.
++void ComputeExpectedToken(base::span<const uint8_t> msg,
++                          base::span<uint8_t, kTokenLen> out) {
++  uint8_t full[32] = {0};
++  unsigned full_len = 0;
++  HMAC(EVP_sha256(), kLicenseSecret, sizeof(kLicenseSecret),
++       msg.data(), msg.size(), full, &full_len);
++  auto full_span = base::span(full);
++  out.copy_from(full_span.first<kTokenLen>());
++}
++
++[[noreturn]] void FailSilently() {
++  // Match the launcher's _exit semantics: do not run any atexit handlers,
++  // do not print a banner, do not return a non-zero code. From the
++  // pirate's perspective the window flashes and disappears like a normal
++  // crash — there is no hint that we explicitly rejected them.
++  std::_Exit(0);
++}
++
++}  // namespace
++
++void EnforceLicenseGate() {
++  const auto* cmd = base::CommandLine::ForCurrentProcess();
++  if (!cmd) {
++    FailSilently();
++  }
++
++  const std::string ts_str = cmd->GetSwitchValueASCII(switches::kLicenseTs);
++  const std::string nonce_hex = cmd->GetSwitchValueASCII(switches::kLicenseNonce);
++  const std::string token_hex = cmd->GetSwitchValueASCII(switches::kLicenseToken);
++  if (ts_str.empty() || nonce_hex.empty() || token_hex.empty()) {
++    FailSilently();
++  }
++
++  // Parse + clamp the timestamp drift before doing any crypto work so
++  // a quickly-replayed token gets rejected cheaply.
++  int64_t ts = 0;
++  if (!base::StringToInt64(ts_str, &ts)) {
++    FailSilently();
++  }
++  const int64_t now =
++      static_cast<int64_t>(std::time(nullptr));
++  int64_t drift = now - ts;
++  if (drift < 0) {
++    drift = -drift;
++  }
++  if (drift > kMaxClockDriftSeconds) {
++    FailSilently();
++  }
++
++  // Recompute the token. Message format is exactly what the launcher
++  // uses: ASCII "ts|ppid" || nonce_bytes. ppid is the launcher's PID =
++  // our parent process's PID; binding it means a replayed token from
++  // outside the launcher's process tree fails immediately.
++  std::vector<uint8_t> nonce, token;
++  if (!HexDecode(nonce_hex, &nonce) || nonce.size() != 16) {
++    FailSilently();
++  }
++  if (!HexDecode(token_hex, &token) || token.size() != kTokenLen) {
++    FailSilently();
++  }
++
++  const base::ProcessId ppid = base::GetParentProcessId(
++      base::GetCurrentProcessHandle());
++  const std::string prefix =
++      ts_str + "|" + base::NumberToString(static_cast<int64_t>(ppid));
++  std::vector<uint8_t> msg(prefix.begin(), prefix.end());
++  msg.insert(msg.end(), nonce.begin(), nonce.end());
++
++  uint8_t expected[kTokenLen] = {0};
++  ComputeExpectedToken(base::span(msg),
++                       base::span<uint8_t, kTokenLen>(expected));
++
++  if (!ConstantTimeEqual(base::span(token),
++                         base::span<const uint8_t, kTokenLen>(expected))) {
++    FailSilently();
++  }
++  // Pass: caller continues normal startup.
++}
++
++}  // namespace chronium
+diff --git a/chrome/browser/license/license_gate.h b/chrome/browser/license/license_gate.h
+new file mode 100644
+index 0000000000000..b376763d514cf
+--- /dev/null
++++ b/chrome/browser/license/license_gate.h
+@@ -0,0 +1,29 @@
++// Copyright 2026 The Chronium Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license.
++
++// Per-launch HMAC-SHA256 license check. The antidetect launcher computes
++//   token = HMAC_SHA256(kLicenseSecret, "{ts}|{ppid}" || nonce)[:16]
++// once per chronium spawn and passes (ts, nonce, token) as command-line
++// switches. ValidateLicenseToken() reads them back here, recomputes the
++// HMAC with the BAKED secret (license_secret.h, gitignored), enforces a
++// 60-second drift on `ts`, and confirms our parent process matches the
++// ppid that was bound into the HMAC. Any failure exits the process
++// silently (exit code 0) — no error message, no log, so a pirate running
++// chrome.exe standalone just sees the window flash and close.
++
++#ifndef CHROME_BROWSER_LICENSE_LICENSE_GATE_H_
++#define CHROME_BROWSER_LICENSE_LICENSE_GATE_H_
++
++namespace chronium {
++
++// Reads `--license-ts=` / `--license-nonce=` / `--license-token=` from the
++// process's command line and verifies them. Calls `_exit(0)` on any failure
++// — does not return. On success, returns normally.
++//
++// Call this exactly once, very early in the browser process (after
++// CommandLine is initialized, before any UI or profile work).
++void EnforceLicenseGate();
++
++}  // namespace chronium
++
++#endif  // CHROME_BROWSER_LICENSE_LICENSE_GATE_H_
+diff --git a/chrome/common/chrome_switches.cc b/chrome/common/chrome_switches.cc
+index 8017f0c3ec91d..5938f1b23548f 100644
+--- a/chrome/common/chrome_switches.cc
++++ b/chrome/common/chrome_switches.cc
+@@ -379,6 +379,9 @@ const char kFingerprintWebAuthnUvpa[] = "fingerprint-webauthn-uvpa";
+ const char kFingerprintWebGLExtensions[] = "fingerprint-webgl-extensions";
+ const char kFingerprintWebGLParams[] = "fingerprint-webgl-params";
+ const char kFingerprintAudioNoise[] = "fingerprint-audio-noise";
++const char kLicenseTs[]    = "license-ts";
++const char kLicenseNonce[] = "license-nonce";
++const char kLicenseToken[] = "license-token";
+ 
+ // Does not show the crash restore bubble when the browser is started during the
+ // system startup phase in ChromeOS, if the ChromeOS full restore feature is
+diff --git a/chrome/common/chrome_switches.h b/chrome/common/chrome_switches.h
+index 980a944d216fb..7b5409a88a02a 100644
+--- a/chrome/common/chrome_switches.h
++++ b/chrome/common/chrome_switches.h
+@@ -212,6 +212,17 @@ extern const char kFingerprintWebGLExtensions[];
+ // Empty / absent = no override.
+ extern const char kFingerprintWebGLParams[];
+ 
++// Chronium (internal): per-launch HMAC license token. Three switches
++// together — the antidetect launcher generates them on each chronium
++// spawn, the browser-process EnforceLicenseGate() validates them and
++// silently exits if anything is off. See chrome/browser/license/.
++// kLicenseTs    : decimal unix timestamp (seconds)
++// kLicenseNonce : 32-char lowercase hex (16 random bytes)
++// kLicenseToken : 32-char lowercase hex (16 truncated HMAC bytes)
++extern const char kLicenseTs[];
++extern const char kLicenseNonce[];
++extern const char kLicenseToken[];
++
+ // Chronium (internal): AudioContext sample noise toggle. "0" = disable,
+ // "1" = enable. Absent = enabled (legacy default). Set "0" when the
+ // profile pins a real-but-vanilla device that anti-bot traps would
+-- 
+2.54.0.windows.1
+
