@@ -1,0 +1,167 @@
+From 3ca0acae9afe39282808867b4049ff9f2cd2bd17 Mon Sep 17 00:00:00 2001
+From: Chronium <chronium@interlink.local>
+Date: Thu, 18 Jun 2026 09:17:55 +0700
+Subject: [PATCH] chronium: account label chip in URL bar (patch 0021)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Multilogin-style chip rendered at the leading edge of the location bar
+when --account-label=<TEXT> is passed at chronium startup. Background
+color is a deterministic hash of the label text so multiple windows
+auto-pick visibly distinct pastels — the antidetect launcher passes
+the user-visible profile.name field so each open window shows its own
+account at a glance, and 10 simultaneous chronium instances stay
+distinguishable on the taskbar / alt-tab list.
+
+Wiring:
+  chrome/common/chrome_switches.{h,cc}: declare kAccountLabel.
+  chrome/browser/ui/views/location_bar/location_bar_view.h: new
+    raw_ptr<views::Label> account_label_chip_ member.
+  chrome/browser/ui/views/location_bar/location_bar_view.cc:
+    - Constructor reads the switch via CommandLine. Empty/absent =
+      account_label_chip_ stays nullptr and no extra view is created.
+    - Builds the chip as a views::Label with white text on a pastel
+      RoundedRectBackground (base::PersistentHash(label) -> color),
+      8px horizontal padding, 4px vertical, tooltip echoes the full
+      label so users with long account names can see it on hover.
+    - Layout(): AddDecoration to leading_decorations after the
+      permission chip but before the location icon, capped at 40% of
+      the bar so the URL still wins on small windows.
+
+No new strings translated; the label text is whatever the launcher
+chose. No prefs/sync surface; chip is per-launch only.
+---
+ .../views/location_bar/location_bar_view.cc   | 51 +++++++++++++++++++
+ .../ui/views/location_bar/location_bar_view.h |  6 +++
+ chrome/common/chrome_switches.cc              |  1 +
+ chrome/common/chrome_switches.h               |  7 +++
+ 4 files changed, 65 insertions(+)
+
+diff --git a/chrome/browser/ui/views/location_bar/location_bar_view.cc b/chrome/browser/ui/views/location_bar/location_bar_view.cc
+index a5039973e1528..11247fe904d6a 100644
+--- a/chrome/browser/ui/views/location_bar/location_bar_view.cc
++++ b/chrome/browser/ui/views/location_bar/location_bar_view.cc
+@@ -16,7 +16,10 @@
+ #include "base/functional/callback_helpers.h"
+ #include "base/i18n/rtl.h"
+ #include "base/metrics/field_trial_params.h"
++#include "base/command_line.h"
++#include "base/hash/hash.h"
+ #include "base/strings/utf_string_conversions.h"
++#include "chrome/common/chrome_switches.h"
+ #include "base/trace_event/trace_event.h"
+ #include "base/trace_event/typed_macros.h"
+ #include "build/build_config.h"
+@@ -328,6 +331,43 @@ void LocationBarView::Init() {
+   const gfx::FontList& page_action_font_list = typography_provider.GetFont(
+       CONTEXT_OMNIBOX_PRIMARY, views::style::STYLE_BODY_3_EMPHASIS);
+ 
++  // Chronium: render --account-label= as a small chip BEFORE the
++  // security icon so the label sits at the left edge of the omnibox.
++  // Same font as merchant-trust chip; rounded background, padding.
++  // No-op when the switch is empty (the View::SetVisible(false) below
++  // keeps the chip off the layout entirely).
++  {
++    const auto* cmd = base::CommandLine::ForCurrentProcess();
++    const std::string label_str =
++        cmd ? cmd->GetSwitchValueASCII(switches::kAccountLabel)
++            : std::string();
++    if (!label_str.empty()) {
++      auto chip = std::make_unique<views::Label>(
++          base::UTF8ToUTF16(label_str),
++          views::style::CONTEXT_LABEL,
++          views::style::STYLE_BODY_5_EMPHASIS);
++      chip->SetAutoColorReadabilityEnabled(false);
++      chip->SetEnabledColor(SK_ColorWHITE);
++      // Background: deterministic pastel from a hash of the label text
++      // so multiple windows pick visibly-distinct colors automatically.
++      const uint32_t h = base::PersistentHash(label_str);
++      const SkColor bg = SkColorSetARGB(
++          0xFF,
++          // Pastel-ish: mid 90-180 range across all channels, biased to
++          // saturation by zeroing one channel.
++          90 + ((h >>  0) & 0x7F),
++          90 + ((h >>  8) & 0x7F),
++          90 + ((h >> 16) & 0x7F));
++      chip->SetBackground(
++          views::CreateRoundedRectBackground(bg, 4));
++      chip->SetBorder(
++          views::CreateEmptyBorder(gfx::Insets::VH(2, 8)));
++      chip->SetElideBehavior(gfx::ELIDE_TAIL);
++      chip->SetTooltipText(base::UTF8ToUTF16(label_str));
++      account_label_chip_ = AddChildView(std::move(chip));
++    }
++  }
++
+   auto location_icon_view =
+       std::make_unique<LocationIconView>(omnibox_chip_font_list, this, this);
+   location_icon_view->set_drag_controller(this);
+@@ -921,6 +961,17 @@ void LocationBarView::Layout(PassKey) {
+     }
+   }
+ 
++  // Chronium: account label chip — leading decoration before the
++  // security icon. AddDecoration appends to the layout in call order,
++  // so this lands to the LEFT of the icon. max_fraction caps the chip
++  // at 40% of bar width on tiny windows so it doesn't crowd out the URL.
++  if (account_label_chip_) {
++    leading_decorations.AddDecoration(vertical_padding, location_height,
++                                      false, /*max_fraction=*/0.4,
++                                      /*intra_item_padding=*/4, icon_left,
++                                      account_label_chip_);
++  }
++
+   if (ShouldShowKeywordBubble()) {
+     location_icon_view_->SetVisible(false);
+     leading_decorations.AddDecoration(
+diff --git a/chrome/browser/ui/views/location_bar/location_bar_view.h b/chrome/browser/ui/views/location_bar/location_bar_view.h
+index 3195e87abbf9b..a927fb8d64c4e 100644
+--- a/chrome/browser/ui/views/location_bar/location_bar_view.h
++++ b/chrome/browser/ui/views/location_bar/location_bar_view.h
+@@ -563,6 +563,12 @@ class LocationBarView
+   std::unique_ptr<MerchantTrustChipButtonController>
+       merchant_trust_chip_controller_;
+ 
++  // Chronium: account label chip (Multilogin-style). Renders the value
++  // of --account-label= as a small rounded label to the left of the
++  // security icon, so users running 10+ chronium windows can tell
++  // them apart. nullptr when the switch is empty / absent.
++  raw_ptr<views::Label> account_label_chip_ = nullptr;
++
+   // An icon to the left of the edit field: the HTTPS lock, blank page icon,
+   // search icon, EV HTTPS bubble, etc.
+   raw_ptr<LocationIconView> location_icon_view_ = nullptr;
+diff --git a/chrome/common/chrome_switches.cc b/chrome/common/chrome_switches.cc
+index 5938f1b23548f..89d305abeaa7f 100644
+--- a/chrome/common/chrome_switches.cc
++++ b/chrome/common/chrome_switches.cc
+@@ -382,6 +382,7 @@ const char kFingerprintAudioNoise[] = "fingerprint-audio-noise";
+ const char kLicenseTs[]    = "license-ts";
+ const char kLicenseNonce[] = "license-nonce";
+ const char kLicenseToken[] = "license-token";
++const char kAccountLabel[] = "account-label";
+ 
+ // Does not show the crash restore bubble when the browser is started during the
+ // system startup phase in ChromeOS, if the ChromeOS full restore feature is
+diff --git a/chrome/common/chrome_switches.h b/chrome/common/chrome_switches.h
+index 7b5409a88a02a..9625bb64a8160 100644
+--- a/chrome/common/chrome_switches.h
++++ b/chrome/common/chrome_switches.h
+@@ -223,6 +223,13 @@ extern const char kLicenseTs[];
+ extern const char kLicenseNonce[];
+ extern const char kLicenseToken[];
+ 
++// Chronium (internal): account label rendered as a small chip in the
++// LocationBarView (URL bar), to the left of the security icon. The
++// antidetect launcher passes the per-profile `name` field here so users
++// running 10+ chronium windows at once can tell them apart at a glance.
++// Empty / absent = no chip rendered (vanilla LocationBarView).
++extern const char kAccountLabel[];
++
+ // Chronium (internal): AudioContext sample noise toggle. "0" = disable,
+ // "1" = enable. Absent = enabled (legacy default). Set "0" when the
+ // profile pins a real-but-vanilla device that anti-bot traps would
+-- 
+2.54.0.windows.1
+
