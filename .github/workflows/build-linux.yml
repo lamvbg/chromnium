@@ -93,26 +93,37 @@ jobs:
           gclient runhooks
 
       # ---- Apply chronium patches ----
+      # Patches 0001-0018 apply cleanly to a fresh Chromium tree.
+      # 0019/0020/0021 were format-patched from a Windows tree that had
+      # earlier patches already absorbed, so their diff context doesn't
+      # line up. Instead of chasing rebase, we ship the FINAL post-patch
+      # copies of the affected files under patches/post-patched/ and
+      # cp them on top of the tree, then commit as one squashed change.
       - name: Apply chronium patches
         run: |
           cd $HOME/cr/src
           git config user.email 'chronium@interlink.local'
           git config user.name 'Chronium'
-          for p in $GITHUB_WORKSPACE/chronium-build/patches/*.patch; do
+
+          # 1. git am 0001-0018 (all clean)
+          for p in $(ls $GITHUB_WORKSPACE/chronium-build/patches/00{01,02,03,04,05,06,07,08,09,10,11,12,13,14,15,16,17,18}-*.patch 2>/dev/null); do
             echo "Applying $(basename $p) ..."
             if ! git am --keep-cr --3way < "$p"; then
-              # 0019/0020/0021 fuzzy-fail — try direct apply + commit
-              git am --abort 2>/dev/null || true
-              if git apply --3way "$p"; then
-                git add -A
-                SUBJECT=$(head -20 "$p" | grep -m1 '^Subject:' | sed 's/^Subject: //; s/\[PATCH\] //')
-                git commit -m "$SUBJECT"
-              else
-                echo "PATCH FAILED: $p"
-                exit 1
-              fi
+              echo "PATCH 0001-0018 FAILED: $p"
+              git am --show-current-patch=diff | head -50
+              exit 1
             fi
           done
+
+          # 2. Squash-apply 0019+0020+0021 by overwriting affected files.
+          POSTPATCH=$GITHUB_WORKSPACE/chronium-build/patches/post-patched
+          if [ -d "$POSTPATCH" ]; then
+            echo "Copying post-patched files (0019+0020+0021 squashed) ..."
+            cp -rv "$POSTPATCH"/. .
+            git add -A
+            git commit -m "chronium: patches 0019+0020+0021 (WebGL virt + license gate + account chip)" || true
+          fi
+
           git log --oneline -25
 
       # ---- Bake license secret from repo secret ----
