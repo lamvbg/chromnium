@@ -1,0 +1,64 @@
+# Example multi-account deploy.
+#
+# The typical anti-detect ops pattern is 1 container per account: each
+# gets its own user-data-dir volume, its own CDP port on the host, its
+# own proxy, and its own fingerprint. Container names double as account
+# labels — the FE chip we render in the URL bar mirrors them.
+#
+# Bring up:
+#   export CHRONIUM_LICENSE_KEY=<64 hex chars from the dev>
+#   docker-compose up -d
+#
+# Control from Playwright / raw CDP:
+#   ws://<host>:9222/devtools/browser/    -> acc1
+#   ws://<host>:9223/devtools/browser/    -> acc2
+#   ws://<host>:9224/devtools/browser/    -> acc3
+#
+# Persist login state / cookies:
+#   ./data/<account>/ mounts inside the container. Nuke to log out.
+
+services:
+
+  acc1-grok:
+    image: chronium-linux:v0.1.5
+    restart: unless-stopped
+    ports:
+      - "9222:9222"
+    environment:
+      CHRONIUM_LICENSE_KEY: "${CHRONIUM_LICENSE_KEY}"
+      ACCOUNT_LABEL: acc1-grok
+      FINGERPRINT: linux-rtx3060
+      START_URL: https://grok.com
+      # SOCKS5 proxy through your rotation; leave unset for direct
+      # PROXY_URL: socks5://user:pass@proxy.example.com:1080
+    volumes:
+      - ./data/acc1-grok:/data/user-data-dir
+    shm_size: 2gb
+
+  acc2-tiktok:
+    image: chronium-linux:v0.1.5
+    restart: unless-stopped
+    ports:
+      - "9223:9222"
+    environment:
+      CHRONIUM_LICENSE_KEY: "${CHRONIUM_LICENSE_KEY}"
+      ACCOUNT_LABEL: acc2-tiktok
+      FINGERPRINT: linux-nvidia-0000174d
+      START_URL: https://www.tiktok.com
+    volumes:
+      - ./data/acc2-tiktok:/data/user-data-dir
+    shm_size: 2gb
+
+  acc3-meta:
+    image: chronium-linux:v0.1.5
+    restart: unless-stopped
+    ports:
+      - "9224:9222"
+    environment:
+      CHRONIUM_LICENSE_KEY: "${CHRONIUM_LICENSE_KEY}"
+      ACCOUNT_LABEL: acc3-meta
+      FINGERPRINT: linux-gtx1050
+      START_URL: https://facebook.com
+    volumes:
+      - ./data/acc3-meta:/data/user-data-dir
+    shm_size: 2gb
