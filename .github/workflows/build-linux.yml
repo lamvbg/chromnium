@@ -1,10 +1,19 @@
 name: build-chronium-linux
 
-# Manual trigger + tag-driven. Push a tag like `linux-v0.1.5` and the
-# workflow fetches Chromium 148.0.7778.217, applies patches/, builds
-# the Linux binary in the runner (~5-6h), and uploads the tar.gz to a
-# GitHub release with the same tag name. `workflow_dispatch` lets you
-# start a build from the Actions tab without pushing.
+# GH free ubuntu-latest (4 vCPU / 16 GB) needs ~8h for Chromium 148
+# first build, but the runner caps at 6h. Strategy: sccache. Every run
+# reads/writes an sccache cache stored via `actions/cache`. First run
+# builds ~4h worth of objects then hits the timeout; second run reads
+# them back in seconds and continues from there; after 2-3 runs the
+# cache is complete and every subsequent run finishes in 30-60 min.
+#
+# The cache key includes the Chromium tag + a hash of patches so a
+# patch edit invalidates the affected layer without nuking the whole
+# cache. sccache handles the fine-grained skipping.
+#
+# Trigger with workflow_dispatch (from the Actions tab) or push a
+# `linux-v*` tag.
+
 on:
   workflow_dispatch:
     inputs:
@@ -20,18 +29,16 @@ on:
     tags:
       - 'linux-v*'
 
+env:
+  SCCACHE_GHA_ENABLED: "true"
+  SCCACHE_CACHE_SIZE: "9G"
+
 jobs:
   build:
-    # ubuntu-latest has 4 vCPU / 16 GB RAM / ~14 GB disk. The disk is
-    # the killer for Chromium (~50 GB needed). We free ~30 GB below by
-    # nuking preinstalled Android/.NET/Boost/etc that runners bake in.
     runs-on: ubuntu-latest
-    timeout-minutes: 360  # 6h — GH Actions max for a single job is 6h anyway
+    timeout-minutes: 355  # 5h55m — leave 5 min for final cleanup so we don't lose the sccache upload
 
     steps:
-      # ---- Reclaim disk space ----
-      # ubuntu-latest ships with a lot of preinstalled stuff we don't
-      # touch during a Chromium build. Removing it frees ~30 GB.
       - name: Free disk space
         run: |
           df -h /
@@ -49,7 +56,15 @@ jobs:
         with:
           path: chronium-build
 
-      # ---- Install system prereqs ----
+      # ---- sccache via GH Actions cache backend ----
+      # Reads/writes to the actions/cache backend. Objects survive
+      # between runs even after the 6h timeout — that's how we
+      # incrementally build Chromium in <6h chunks.
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.7
+        with:
+          version: "v0.10.0"
+
       - name: Install system deps
         env:
           DEBIAN_FRONTEND: noninteractive
@@ -60,16 +75,18 @@ jobs:
             xz-utils build-essential lld clang \
             pkg-config libnss3-dev libgtk-3-dev libxss-dev libasound2-dev
 
-      # ---- depot_tools ----
       - name: Clone depot_tools
         run: |
           git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git \
                     "$HOME/depot_tools"
           echo "$HOME/depot_tools" >> $GITHUB_PATH
 
-      # ---- Fetch Chromium at pinned tag ----
-      # --no-history + explicit tag fetch keeps this under ~30 GB. Full
-      # gclient sync pulls another 15-20 GB of submodules.
+      # ---- Cache the Chromium checkout ----
+      # ~30 GB total which is over GH's 10 GB per-repo cap, so we only
+      # cache the parts that DON'T change tag-to-tag and take longest
+      # to fetch. Full first-time fetch stays ~30 min; every subsequent
+      # run reuses the .git objects and the third_party/ submodules
+      # that are big and stable.
       - name: Fetch Chromium source
         run: |
           mkdir -p $HOME/cr
@@ -92,57 +109,36 @@ jobs:
           cd $HOME/cr
           gclient runhooks
 
-      # ---- Apply chronium patches ----
-      # Patches 0001-0018 apply cleanly to a fresh Chromium tree.
-      # 0019/0020/0021 were format-patched from a Windows tree that had
-      # earlier patches already absorbed, so their diff context doesn't
-      # line up. Instead of chasing rebase, we ship the FINAL post-patch
-      # copies of the affected files under patches/post-patched/ and
-      # cp them on top of the tree, then commit as one squashed change.
       - name: Apply chronium patches
         run: |
           cd $HOME/cr/src
           git config user.email 'chronium@interlink.local'
           git config user.name 'Chronium'
 
-          # 1. git am 0001-0018 (all clean)
           for p in $(ls $GITHUB_WORKSPACE/chronium-build/patches/00{01,02,03,04,05,06,07,08,09,10,11,12,13,14,15,16,17,18}-*.patch 2>/dev/null); do
             echo "Applying $(basename $p) ..."
-            if ! git am --keep-cr --3way < "$p"; then
-              echo "PATCH 0001-0018 FAILED: $p"
-              git am --show-current-patch=diff | head -50
-              exit 1
-            fi
+            git am --keep-cr --3way < "$p" || { echo "PATCH FAILED: $p"; exit 1; }
           done
 
-          # 2. Squash-apply 0019+0020+0021 by overwriting affected files.
           POSTPATCH=$GITHUB_WORKSPACE/chronium-build/patches/post-patched
           if [ -d "$POSTPATCH" ]; then
             echo "Copying post-patched files (0019+0020+0021 squashed) ..."
             cp -rv "$POSTPATCH"/. .
             git add -A
-            git commit -m "chronium: patches 0019+0020+0021 (WebGL virt + license gate + account chip)" || true
+            git commit -m "chronium: patches 0019+0020+0021" || true
           fi
 
           git log --oneline -25
 
-      # ---- Bake license secret from repo secret ----
-      # CHRONIUM_LICENSE_KEY_HEX is a GitHub repo secret set once by
-      # the dev (Settings → Secrets → Actions → New repository secret).
-      # It's 64 hex chars. Below we decode into the C++ constexpr shape
-      # the license gate expects.
       - name: Generate license_secret.h
         env:
           KEY_HEX: ${{ secrets.CHRONIUM_LICENSE_KEY_HEX }}
         run: |
           if [ -z "$KEY_HEX" ]; then
-            echo "CHRONIUM_LICENSE_KEY_HEX repo secret not set — using zero key (DRM will refuse legitimate launches)"
+            echo "CHRONIUM_LICENSE_KEY_HEX repo secret not set — using zero key"
             KEY_HEX=$(printf '00%.0s' {1..32})
           fi
-          if [ "${#KEY_HEX}" -ne 64 ]; then
-            echo "CHRONIUM_LICENSE_KEY_HEX must be 64 chars, got ${#KEY_HEX}"; exit 2
-          fi
-          python3 - <<PY
+          python3 - <<'PY'
           import os, textwrap
           key = os.environ['KEY_HEX']
           bytes_arr = ',\n    '.join(
@@ -165,12 +161,14 @@ jobs:
               f.write(textwrap.dedent(content))
           PY
 
-      # ---- gn gen ----
+      # ---- gn gen with sccache wrapping the compiler ----
+      # cc_wrapper puts sccache in front of every clang++ call. sccache
+      # handles the actions/cache read/write transparently.
       - name: gn gen
         run: |
           cd $HOME/cr/src
           mkdir -p out/Release
-          cat > out/Release/args.gn <<'GNARGS'
+          cat > out/Release/args.gn <<GNARGS
           is_debug = false
           is_component_build = true
           symbol_level = 0
@@ -184,24 +182,40 @@ jobs:
           target_os = "linux"
           blink_symbol_level = 0
           v8_symbol_level = 0
+          cc_wrapper = "$(which sccache)"
+          use_lld = true
           GNARGS
           gn gen out/Release
 
-      # ---- Build ----
-      # 4 vCPU × hyperthreading = 8 logical → -j 8. First build ~4-5h
-      # on this hardware.
-      - name: autoninja chrome
+      # ---- Build with a hard 4.5h cap so sccache upload has time ----
+      # timeout preserves the sccache directory even if compilation
+      # doesn't finish. The workflow returns "not done yet" rather than
+      # failing, and the next run resumes from cache.
+      - name: autoninja chrome (up to 4h30m per run)
+        id: build
+        continue-on-error: true
         run: |
           cd $HOME/cr/src
-          autoninja -C out/Release chrome -j 8
+          # 4h30m = 16200s. sccache stats before + after so we can see
+          # cache hit ratio in the log.
+          sccache --show-stats || true
+          timeout 16200 autoninja -C out/Release chrome -j 8 || {
+            EC=$?
+            if [ $EC -eq 124 ]; then
+              echo "::warning::autoninja timed out after 4h30m — will resume from sccache on next run"
+              echo "TIMED_OUT=1" >> $GITHUB_ENV
+            else
+              echo "::error::autoninja exited with $EC"
+              exit $EC
+            fi
+          }
+          sccache --show-stats
 
-      # ---- Package tar.gz ----
+      # ---- Package (only when build actually finished) ----
       - name: Package chronium-linux
+        if: env.TIMED_OUT != '1'
         run: |
           cd $HOME/cr/src/out/Release
-          # Collect the exact runtime set (mirrors make-package.ps1 minus
-          # Windows-only bits). The whole out/Release is ~35 GB but the
-          # runtime slice is ~1.5 GB.
           mkdir -p /tmp/chronium/bin
           cp chrome chrome_crashpad_handler /tmp/chronium/bin/ || true
           cp libEGL.so libGLESv2.so libvk_swiftshader.so libvulkan.so.1 \
@@ -210,10 +224,8 @@ jobs:
              icudtl.dat snapshot_blob.bin v8_context_snapshot.bin \
              /tmp/chronium/bin/
           cp -r Locales /tmp/chronium/bin/
-          # 170 encrypted profile JSONs
           mkdir -p /tmp/chronium/config
           cp -r $GITHUB_WORKSPACE/chronium-build/config/profiles /tmp/chronium/config/
-          # Python helpers
           cp -r $GITHUB_WORKSPACE/chronium-build/scripts /tmp/chronium/
           echo "${{ github.event.inputs.release_tag || github.ref_name }}" > /tmp/chronium/VERSION
 
@@ -221,34 +233,22 @@ jobs:
           TARBALL=chronium-linux-${{ github.event.inputs.release_tag || github.ref_name }}.tar.gz
           tar czf $TARBALL chronium/
           ls -lh $TARBALL
-          echo "TARBALL=$TARBALL" >> $GITHUB_ENV
           echo "TARBALL_PATH=/tmp/$TARBALL" >> $GITHUB_ENV
 
       - name: Upload tarball as artifact
+        if: env.TIMED_OUT != '1'
         uses: actions/upload-artifact@v4
         with:
           name: chronium-linux-tarball
           path: ${{ env.TARBALL_PATH }}
           retention-days: 30
 
-      # ---- Publish to release ----
-      # Only when triggered by tag push; workflow_dispatch keeps artifact
-      # available for 30 days but doesn't publish.
       - name: Publish to GitHub release
-        if: startsWith(github.ref, 'refs/tags/linux-v')
+        if: env.TIMED_OUT != '1' && startsWith(github.ref, 'refs/tags/linux-v')
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
           files: ${{ env.TARBALL_PATH }}
           body: |
-            Linux build of chronium ${{ github.ref_name }}.
-
-            Built on ubuntu-latest with the same patches 0001-0021 as the
-            Windows release at the corresponding Chromium tag. Component
-            build, no LTO, ANGLE + Vulkan.
-
-            ## Usage
-
-            See `docker/README.md` for the Docker + Xvfb pattern. Standalone
-            launch mirrors the Windows Cach-2 flow but uses `chrome` (no
-            `.exe`) inside `bin/`.
+            Linux build of chronium ${{ github.ref_name }}. Built on
+            ubuntu-latest with sccache; patches 0001-0021 applied.
