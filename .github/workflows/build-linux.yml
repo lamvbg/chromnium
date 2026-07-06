@@ -29,14 +29,12 @@ on:
     tags:
       - 'linux-v*'
 
-env:
-  SCCACHE_GHA_ENABLED: "true"
-  SCCACHE_CACHE_SIZE: "9G"
-
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 355  # 5h55m — leave 5 min for final cleanup so we don't lose the sccache upload
+    # Full 6h budget. GH Actions cap is 360 min; leaving 5 min lets the
+    # Post * cleanup steps run after autoninja returns.
+    timeout-minutes: 355
 
     steps:
       - name: Free disk space
@@ -56,14 +54,16 @@ jobs:
         with:
           path: chronium-build
 
-      # ---- sccache via GH Actions cache backend ----
-      # Reads/writes to the actions/cache backend. Objects survive
-      # between runs even after the 6h timeout — that's how we
-      # incrementally build Chromium in <6h chunks.
-      - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.7
-        with:
-          version: "v0.10.0"
+      # sccache removed 2026-07-06: mozilla-actions/sccache-action + the
+      # actions/cache backend it wraps kept returning "Our services
+      # aren't available right now" for hours (Azure Edge issue on
+      # GH's side). Every clang++ invocation was going through sccache
+      # first, hitting the failed backend, and exiting non-zero — so
+      # ninja registered every compile as FAILED and the build died at
+      # step ~1200 of 75851. Falling back to a plain build. If we
+      # can't fit inside the 6h cap that's a separate problem to solve
+      # (larger runner, split job, etc.), but at least it will make
+      # forward progress.
 
       - name: Install system deps
         env:
@@ -161,14 +161,11 @@ jobs:
               f.write(textwrap.dedent(content))
           PY
 
-      # ---- gn gen with sccache wrapping the compiler ----
-      # cc_wrapper puts sccache in front of every clang++ call. sccache
-      # handles the actions/cache read/write transparently.
       - name: gn gen
         run: |
           cd $HOME/cr/src
           mkdir -p out/Release
-          cat > out/Release/args.gn <<GNARGS
+          cat > out/Release/args.gn <<'GNARGS'
           is_debug = false
           is_component_build = true
           symbol_level = 0
@@ -182,38 +179,16 @@ jobs:
           target_os = "linux"
           blink_symbol_level = 0
           v8_symbol_level = 0
-          cc_wrapper = "$(which sccache)"
           use_lld = true
           GNARGS
           gn gen out/Release
 
-      # ---- Build with a hard 4.5h cap so sccache upload has time ----
-      # timeout preserves the sccache directory even if compilation
-      # doesn't finish. The workflow returns "not done yet" rather than
-      # failing, and the next run resumes from cache.
-      - name: autoninja chrome (up to 4h30m per run)
-        id: build
-        continue-on-error: true
+      - name: autoninja chrome
         run: |
           cd $HOME/cr/src
-          # 4h30m = 16200s. sccache stats before + after so we can see
-          # cache hit ratio in the log.
-          sccache --show-stats || true
-          timeout 16200 autoninja -C out/Release chrome -j 8 || {
-            EC=$?
-            if [ $EC -eq 124 ]; then
-              echo "::warning::autoninja timed out after 4h30m — will resume from sccache on next run"
-              echo "TIMED_OUT=1" >> $GITHUB_ENV
-            else
-              echo "::error::autoninja exited with $EC"
-              exit $EC
-            fi
-          }
-          sccache --show-stats
+          autoninja -C out/Release chrome -j 8
 
-      # ---- Package (only when build actually finished) ----
       - name: Package chronium-linux
-        if: env.TIMED_OUT != '1'
         run: |
           cd $HOME/cr/src/out/Release
           mkdir -p /tmp/chronium/bin
@@ -236,7 +211,6 @@ jobs:
           echo "TARBALL_PATH=/tmp/$TARBALL" >> $GITHUB_ENV
 
       - name: Upload tarball as artifact
-        if: env.TIMED_OUT != '1'
         uses: actions/upload-artifact@v4
         with:
           name: chronium-linux-tarball
@@ -244,7 +218,7 @@ jobs:
           retention-days: 30
 
       - name: Publish to GitHub release
-        if: env.TIMED_OUT != '1' && startsWith(github.ref, 'refs/tags/linux-v')
+        if: startsWith(github.ref, 'refs/tags/linux-v')
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
