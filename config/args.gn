@@ -46,9 +46,28 @@ use_official_google_api_keys = false
 # Disable subsystems we don't want shipped.
 enable_widevine = false
 
-# Open codecs only (no licensing concerns; users wanting H.264/AAC
-# can flip these on at their own legal risk).
-proprietary_codecs = false
-ffmpeg_branding = "Chromium"
+# Proprietary codecs ENABLED — TikTok, Facebook, Instagram, most
+# video sites serve H.264/AAC (and TikTok increasingly HEVC via
+# hev1.1.6.L120.90). Without these the browser can't decode ANY
+# H.264/HEVC video → MediaSource.addSourceBuffer('video/mp4;codecs=...')
+# returns unsupported → video element shows black frame + fatal JS
+# error. This affects nearly every mainstream site.
+#
+# ffmpeg_branding = "Chrome" enables the closed-source ffmpeg build
+# path that includes H.264, HEVC, AAC. Legal note: OK for internal/
+# personal use, users doing commercial redistribution should check
+# Cisco H.264 / MPEG-LA HEVC licensing themselves — same posture as
+# Brave, Vivaldi, Ungoogled-Chromium.
+proprietary_codecs = true
+ffmpeg_branding = "Chrome"
+
+# HEVC on Windows: use system Media Foundation decoder (hardware
+# accelerated on Intel Quick Sync / NVENC / AMD VCN). This is what
+# stock Chrome does on Win10+; no extra ffmpeg bloat.
+enable_platform_hevc = true
+enable_hevc_parser_and_hw_decoder = true
+enable_platform_ac3_eac3_audio = true
+enable_platform_dts_audio = false
+enable_platform_mpeg_h_audio = false
 
 target_cpu = "x64"
