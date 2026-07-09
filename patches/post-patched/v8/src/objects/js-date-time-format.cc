@@ -694,6 +694,48 @@ MaybeDirectHandle<JSObject> JSDateTimeFormat::ResolvedOptions(
   DirectHandle<Object> resolved_obj;
 
   DirectHandle<String> locale(date_time_format->locale(), isolate);
+  // Chronium: ICU strips the region tag from a locale when the language
+  // has a single "default" region (vi -> vi, th -> th, ...). Modern
+  // browsers keep the region (Chrome on Vietnamese Windows returns
+  // "vi-VN", not "vi"), so fingerprinters treat the bare form as an
+  // anomaly. Force the modern region-qualified form for the languages
+  // where the default-region drop is fingerprint-visible.
+  {
+    std::string locale_str;
+    if (locale->IsOneByteRepresentation()) {
+      const uint32_t len = locale->length();
+      locale_str.reserve(len);
+      for (uint32_t i = 0; i < len; ++i) {
+        locale_str.push_back(static_cast<char>(
+            Cast<SeqOneByteString>(*locale)->Get(i)));
+      }
+    }
+    static const struct { const char* from; const char* to; } kLocaleAlias[] = {
+        {"vi",  "vi-VN"},
+        {"th",  "th-TH"},
+        {"ja",  "ja-JP"},
+        {"ko",  "ko-KR"},
+        {"id",  "id-ID"},
+        {"tr",  "tr-TR"},
+        {"pl",  "pl-PL"},
+        {"nl",  "nl-NL"},
+        {"cs",  "cs-CZ"},
+        {"el",  "el-GR"},
+        {"hu",  "hu-HU"},
+        {"ro",  "ro-RO"},
+        {"sv",  "sv-SE"},
+        {"da",  "da-DK"},
+        {"fi",  "fi-FI"},
+        {"no",  "nb-NO"},
+        {"he",  "he-IL"},
+    };
+    for (const auto& a : kLocaleAlias) {
+      if (locale_str == a.from) {
+        locale = factory->NewStringFromAsciiChecked(a.to);
+        break;
+      }
+    }
+  }
   DCHECK(!date_time_format->icu_locale().is_null());
   Managed<icu::Locale>::Ptr icu_locale = date_time_format->icu_locale()->ptr();
   DCHECK_NOT_NULL(icu_locale);
